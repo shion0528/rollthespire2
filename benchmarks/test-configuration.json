@@ -1,0 +1,91 @@
+{
+  "capturedHardware": {
+    "capturedUtc": "2026-10-26T00:44:56.9811679Z",
+    "cpu": {
+      "Name": "Intel(R) Core(TM) i9-14900HX",
+      "NumberOfCores": 24,
+      "NumberOfLogicalProcessors": 32,
+      "MaxClockSpeed": 2200
+    },
+    "systemMemoryBytes": 68314161152,
+    "gpuCsvColumns": "name,driver_version,memory.totalMiB,pstate,tempC,power.limitW",
+    "gpuCsv": "NVIDIA GeForce RTX 4090 Laptop GPU, 596.49, 16376, P0, 64, [N/A]",
+    "logicalProcessorsUsedByObserver": 32,
+    "telemetryGpuPercentIsDeviceSampleNotKernelTimer": true,
+    "osReportedCpuMHzIsNotCycleAccurate": true
+  },
+  "configurationNotes": [
+    {
+      "item": "处理器",
+      "value": "Intel Core i9-14900HX，24核、32逻辑处理器"
+    },
+    {
+      "item": "内存",
+      "value": "系统报告 68,314,161,152 bytes（63.62 GiB，约64GiB配置）"
+    },
+    {
+      "item": "显卡",
+      "value": "NVIDIA GeForce RTX 4090 Laptop GPU，16376 MiB显存（约16GiB）"
+    },
+    {
+      "item": "驱动",
+      "value": "596.49，来自2026-10-26历史硬件快照；后续场次未重新完整采集驱动/内存快照"
+    },
+    {
+      "item": "游戏",
+      "value": "Slay the Spire 2，0.111.0，Beta111预测配置"
+    },
+    {
+      "item": "游戏引擎与图形后端",
+      "value": "原始日志：MegaDot v4.5.1.m.14.mono.custom_build；D3D12 12_0，Forward+"
+    },
+    {
+      "item": "运行环境",
+      "value": "沿用游戏自带.NET/Godot；源码目标框架net9.0；每轮实际.NET补丁版本未记录"
+    },
+    {
+      "item": "操作系统补录",
+      "value": "2026-10-27整理时查询：Windows 11 家庭版中文版，10.0.26200，Build 26200；不是2026-10-26逐轮OS快照"
+    },
+    {
+      "item": "功耗限制与实际CPU频率",
+      "value": "GPU功耗上限历史采样为N/A；未记录可用的CPU实测频率，不能将OS报告2200MHz当作实际跑种频率"
+    },
+    {
+      "item": "请求工作线程",
+      "value": "32；不保证两个版本实际采用相同物理并行度。原版CPU路线P1到新版P32是产品实现差异之一"
+    },
+    {
+      "item": "优化开关",
+      "value": "候选版七项正式优化全开；原版是独立上游源码，不是把新版开关全部关闭"
+    },
+    {
+      "item": "枚举起点",
+      "value": "9KT7EQEZ0000；预热推进后开始计时。不同预热预算的计时区间会不同"
+    },
+    {
+      "item": "批次和预热",
+      "value": "各场景分别记录，见原始计时表及presets.json backendGeometry；0批次上限表示采用该产品原生窗口"
+    },
+    {
+      "item": "原全量帧率",
+      "value": "启动请求 --minimized --max-fps 30；未记录逐计时窗口actualFPS，不声称实测稳定30FPS"
+    },
+    {
+      "item": "原全量结果读取",
+      "value": "raw结果队列4096，主线程按帧排空；这不是后来使用的连续读取协议"
+    },
+    {
+      "item": "后续16/17公平对照",
+      "value": "强制30FPS并记录实际帧率；同一raw连续读取器、输出队列4096；不含完整界面保存与渲染"
+    },
+    {
+      "item": "接收器帧率诊断",
+      "value": "同resource.16、目标int.MaxValue、源队列4096、接收缓冲65536、主线程每帧排空；与普通UI目标1至1000不同"
+    },
+    {
+      "item": "预测前提",
+      "value": "冻结预设使用AncientPremises.BroadDefault，完整前提位在presets.json；事件/商店结果预测以进入相应事件或商店为前提，不证明地图可达"
+    }
+  ]
+}

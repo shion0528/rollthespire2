@@ -66,4 +66,25 @@ public static class RuntimeProfileRegistry
             _ => UnsupportedPredictionProfile.Instance.Predict(request, detection)
         };
     }
+
+    internal static SeedPredictionDocument PredictFromRootHashCapturingOpening(GameVersionDetection detection,
+        SeedPredictionRequest request, TrustedRootHashInput input, out Beta111NeowOpeningProof? opening)
+    {
+        ArgumentNullException.ThrowIfNull(detection);
+        ArgumentNullException.ThrowIfNull(request);
+        opening = null;
+        return Resolve(detection).ProfileId == RuntimeProfileId.Beta111
+            ? Beta111PredictionProfile.Instance.PredictFromRootHashCapturingOpening(request, detection, input, out opening)
+            : PredictFromRootHash(detection, request, input);
+    }
+
+    internal static SeedPredictionDocument PredictFromRootHashReusingOpening(GameVersionDetection detection,
+        SeedPredictionRequest request, TrustedRootHashInput input, Beta111NeowOpeningProof opening)
+    {
+        ArgumentNullException.ThrowIfNull(detection);
+        ArgumentNullException.ThrowIfNull(request);
+        return Resolve(detection).ProfileId == RuntimeProfileId.Beta111
+            ? Beta111PredictionProfile.Instance.PredictFromRootHashReusingOpening(request, detection, input, opening)
+            : PredictFromRootHash(detection, request, input);
+    }
 }

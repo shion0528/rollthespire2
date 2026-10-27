@@ -218,20 +218,21 @@ internal sealed partial class SearchWorkspacePersistence
     }
 
     private void RecordHistoryResult(PersistedSearchResult result)
+        => RecordHistoryResults([result]);
+
+    private void RecordHistoryResults(IReadOnlyList<PersistedSearchResult> results)
     {
-        if (ActiveHistory is { } record)
-        {
-            Accumulate(record.Results, result);
-            if (record.Results.Count > ResultsPerQuery) record.Results.RemoveAt(0);
-            _workspace.Results = record.Results.ToList();
-        }
-        else
-        {
-            Accumulate(_workspace.Results, result);
-            if (_workspace.Results.Count > ResultsPerQuery) _workspace.Results.RemoveAt(0);
-        }
+        if (results.Count == 0) return;
+        QueryHistoryEntry? record = ActiveHistory;
         _displayResults ??= _workspace.Results.ToList();
-        Accumulate(_displayResults, result);
+        foreach (var result in results)
+        {
+            List<PersistedSearchResult> saved = record?.Results ?? _workspace.Results;
+            Accumulate(saved, result);
+            if (saved.Count > ResultsPerQuery) saved.RemoveAt(0);
+            Accumulate(_displayResults, result);
+        }
+        if (record is not null) _workspace.Results = record.Results.ToList();
         ResultsRevision++; MarkWorkspaceDirty();
     }
 

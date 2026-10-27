@@ -21,14 +21,15 @@ internal sealed partial record RelicFullGpuPlan(RelicFamilyPlan SequencePlan, ui
     internal const uint FixedBonesArrival = 1;
     internal const uint GroupedBonesArrival = 2;
     internal const uint SourceConstrainedBonesArrival = 3;
+    private readonly string _sharedPrefixRevision = SharedVisibleSeedGpuCache.RevisionSuffix;
     internal bool SourceConstrainedCapsules => CapsuleMetadata[0] == SourceConstrainedBonesArrival;
-    internal string Revision(bool compact) => GenericReplay ? "R.Relic.Gpu.GenericCapsule.20260922." + (compact ? "Compact" : "Dense") : SourceConstrainedCapsules
+    internal string Revision(bool compact) => (GenericReplay ? "R.Relic.Gpu.GenericCapsule.20260922." + (compact ? "Compact" : "Dense") : SourceConstrainedCapsules
         ? $"R.Relic.Rfull.SourceConstrainedSmallLarge.{(compact ? "Compact" : "Dense")}.CanonicalAbi1Ready.20260913.v2"
         : CapsuleMetadata[0] == FixedBonesArrival
         ? $"R.Relic.Rfull.FixedBones.{(compact ? "Compact" : "Dense")}.CanonicalAbi1Ready.20260913.v5"
         : CapsuleMetadata[0] == GroupedBonesArrival && CapsuleMetadata[29] != 0
         ? $"R.Relic.Rfull.GroupedPinned.{(compact ? "Compact" : "Dense")}.CanonicalAbi1Ready.20260913.v5"
-        : compact ? CompactRevision : DenseRevision;
+        : compact ? CompactRevision : DenseRevision) + _sharedPrefixRevision;
     private const int CurseIdsOffset = 32;
     private const int BonesIdsOffset = 42;
     private const int BucketLengthsOffset = 106;

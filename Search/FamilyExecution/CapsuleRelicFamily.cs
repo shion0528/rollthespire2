@@ -13,17 +13,22 @@ internal sealed partial class CapsuleRelicFamily : IFamilyInvocation
     IEnumerable<GpuLocalPeak> IFamilyInvocation.CostPeaks => _costSamples.Peaks;
     void IFamilyInvocation.LogExecutionEvidence() => _costSamples.WriteSummary();
     bool IFamilyInvocation.CanBindPrivateSerial => _gpuPlan is not null && !_gpuDisabled;
-    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest geometry) =>
-        RelicPhysicalPricing.QuoteCapsule(_request, _gpuPlan, geometry);
+    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest geometry)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return RelicPhysicalPricing.QuoteCapsule(_request, _gpuPlan, geometry);
+    }
     FamilyPrivateGpuExecution IFamilyInvocation.BindPrivateSerial(Godot.RenderingDevice rd,
         PrivateOrdinalBuffer? input, PrivateOrdinalBuffer? output)
     {
         if (_gpuPlan is null || _gpuDisabled) throw new InvalidOperationException("Rfull.PrivateSerialNotAdmitted");
-        return RelicFamilyGpuExecutor.Create(rd, _request, _gpuPlan, input, false, output).BindPrivateSerial();
+        var gpu = RelicFamilyGpuExecutor.Create(rd, _request, _gpuPlan, input, false, output);
+        return _headerTransport.Bind(gpu.BindPrivateSerial(), input, output, () => gpu.HeaderReadbackRevision);
     }
     private static readonly IReadOnlySet<string> Empty = new HashSet<string>();
     private const int ReferenceSampleCapacity = 256;
     private readonly ExactSearchExecutionRequest _request;
+    private readonly FamilyHeaderTransportPerformance _headerTransport;
     private readonly CapsuleRelicReplay _replay;
     private readonly NeowFamilyProjections _models;
     private readonly FamilyCpuExecution _cpu;
@@ -44,6 +49,8 @@ internal sealed partial class CapsuleRelicFamily : IFamilyInvocation
 
     private CapsuleRelicFamily(ExactSearchExecutionRequest request, NeowReplayPlan route)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
+        _headerTransport = new(request.RunOptions.Optimizations);
         _request = request;
         _replay = new(request, route);
         _models = new(request, route, true, _replay.Pool);
@@ -66,12 +73,13 @@ internal sealed partial class CapsuleRelicFamily : IFamilyInvocation
     public FamilyConditionPerformanceProjection ConditionPerformance => ResolveConditionPerformance(false);
     public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compactAbi1Input) => _gpuPlan is null
         ? _cpu.Condition(compactAbi1Input)
-        : new FamilyConditionPerformanceProjection(
+        : _headerTransport.Apply(new FamilyConditionPerformanceProjection(
             FamilyId,
             _gpuPlan.Revision(compactAbi1Input),
             "Rfull.ConditionPerformance.Neutral.CanonicalBoundary.20260906.v4",
             1d,
-            "NoAcceptedWithinPathCurve;timingBoundary=CanonicalAbi1Ready;independentRfullIdentity=true");
+            "NoAcceptedWithinPathCurve;timingBoundary=CanonicalAbi1Ready;independentRfullIdentity=true"),
+            _gpu?.HeaderReadbackRevision);
 
     public FamilyPerformanceObservation CapturePerformanceObservation() => _gpuPlan is null
         ? _cpu.Observation()

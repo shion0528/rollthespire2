@@ -11,8 +11,14 @@ internal sealed class EwPrivateGpuExecutor : IDisposable
 
     internal const int MaxRoots = PrivateOrdinalBuffer.Capacity;
     private readonly RenderingDevice _rd;
+    private readonly FamilyGpuHeaderReadback _headerReadback;
+    internal string HeaderReadbackRevision => CombineHeaderReadbackRevisions(
+        _headerReadback.Revision, _world.HeaderReadbackRevision);
+    internal static string CombineHeaderReadbackRevisions(string eventRevision, string worldRevision) =>
+        eventRevision == worldRevision ? eventRevision : "E." + eventRevision + ".W." + worldRevision;
     private readonly List<Rid> _owned = [];
     private readonly Rid _batch, _header, _output, _pipeline, _uniforms;
+    private readonly SharedVisibleSeedGpuCache? _seedCache;
     private readonly WorldFamilyGpuExecutor _world;
     private readonly PrivateOrdinalBuffer _ordinals;
     private readonly EventResultFamilyGpuExecutor? _referenceE;
@@ -27,6 +33,7 @@ internal sealed class EwPrivateGpuExecutor : IDisposable
     internal EwPrivateGpuExecutor(RenderingDevice rd, EventResultFamilyPlan e, WorldFamilyGpuPlan w, bool verify)
     {
         _rd = rd; _capacity = e.Capacity;
+        _headerReadback = new(rd, FamilyGpuHeaderReadback.Requested);
         var timer = Stopwatch.StartNew();
         Rid Add(Rid r) { _owned.Add(r); return r; }
         Rid Data(uint[] a) => Add(FamilyGpuComputeUtility.CreateStorageBuffer(rd, FamilyGpuComputeUtility.ToBytesNonEmpty(a)));
@@ -39,6 +46,7 @@ internal sealed class EwPrivateGpuExecutor : IDisposable
             _ordinals = new PrivateOrdinalBuffer(rd);
             buffers[5] = _output = _ordinals.Buffer;
             string shaderSource = e.ShaderSource();
+            _seedCache = SharedVisibleSeedGpuCache.Attach(rd, _owned, ref shaderSource, ref buffers, "EW.EventResult");
             Rid shader = Add(FamilyGpuComputeUtility.CompileShader(rd, shaderSource, "E.Y1Private"));
             _pipeline = Add(FamilyGpuComputeUtility.CreateComputePipeline(rd, shader, "EW.EventResult"));
             if (!rd.ComputePipelineIsValid(_pipeline)) throw new InvalidOperationException("E.Y1PipelineInvalid");
@@ -66,8 +74,9 @@ internal sealed class EwPrivateGpuExecutor : IDisposable
         if (!input.IsDense || input.Count > MaxRoots) throw new InvalidOperationException("EW.DenseBatchBoundViolation");
         token.ThrowIfCancellationRequested();
         var timer = Stopwatch.StartNew(); double dispatchMs = 0;
+        if (input.Count > 0) _seedCache?.Refresh(input.Batch);
         FamilyGpuComputeUtility.Update(_rd, _header, Header(), "EW.EHeader");
-        int dispatches = 0;
+        int dispatches = 0; uint[]? h = null; double headerTransportMs = 0;
         for (int offset = 0; offset < input.Count; offset += _capacity)
         {
             token.ThrowIfCancellationRequested(); int count = Math.Min(_capacity, input.Count-offset);
@@ -81,17 +90,26 @@ internal sealed class EwPrivateGpuExecutor : IDisposable
                 _rd.ComputeListDispatch(list, (uint)((count+63)/64), 1, 1);
             }
             finally { _rd.ComputeListEnd(); }
-            FamilyGpuComputeUtility.SubmitAndSync(_rd, "EW.EventResult"); dispatches++;
+            if (offset + count == input.Count)
+            {
+                double completionStart = timer.Elapsed.TotalMilliseconds;
+                h = _headerReadback.CompleteRecorded(_header, 8, true, "EW.EventResult", static () => { });
+                headerTransportMs += Math.Max(0, timer.Elapsed.TotalMilliseconds - completionStart -
+                    _headerReadback.LastSubmitMs - _headerReadback.LastSyncMs);
+            }
+            else FamilyGpuComputeUtility.SubmitAndSync(_rd, "EW.EventResult");
+            dispatches++;
             dispatchMs += timer.Elapsed.TotalMilliseconds-start;
         }
+        dispatchMs -= headerTransportMs;
         token.ThrowIfCancellationRequested();
         double readStart = timer.Elapsed.TotalMilliseconds;
-        uint[] h = FamilyGpuComputeUtility.FromUInt32Bytes(_rd.BufferGetData(_header));
+        h ??= _headerReadback.CompleteRecorded(_header, 8, false, "EW.EventResult.Empty", static () => { });
         if (h.Length != 8 || h[0] != 0x45524652u || h[1] != 1 || h[5] != 0x45524652u || h[3] != 0 || h[4] != input.Count || h[2] > input.Count)
             throw new InvalidDataException("EW.EHeaderFault:" + string.Join(',',h));
         int intermediate = checked((int)h[2]);
         _ordinals.CheckPopulation(input.Batch, intermediate);
-        double readMs = timer.Elapsed.TotalMilliseconds-readStart;
+        double readMs = headerTransportMs + timer.Elapsed.TotalMilliseconds-readStart;
         double eMs = timer.Elapsed.TotalMilliseconds;
         var final = _world.ExecutePrivate(input.Batch, intermediate, token, out var wm);
         canonicalMs = timer.Elapsed.TotalMilliseconds;

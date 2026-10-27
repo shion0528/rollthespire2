@@ -11,8 +11,11 @@ internal sealed class CombatRewardGpuExecutor : IDisposable
 {
     internal const int Capacity = 1 << 20;
     private readonly RenderingDevice _rd;
+    private readonly FamilyGpuHeaderReadback _headerReadback;
+    internal string HeaderReadbackRevision => _headerReadback.Revision;
     private readonly List<Rid> _owned = new();
     private readonly Rid _batch, _header, _input, _output, _pipeline, _uniforms;
+    private readonly SharedVisibleSeedGpuCache? _visibleSeedCache;
     private readonly int _owner = System.Environment.CurrentManagedThreadId;
     private readonly int _routes;
     private readonly PrivateOrdinalBuffer? _privateOutput;
@@ -25,6 +28,7 @@ internal sealed class CombatRewardGpuExecutor : IDisposable
     internal CombatRewardGpuExecutor(RenderingDevice rd, CombatRewardGpuPlan plan, bool forceGeneric = false, PrivateOrdinalBuffer? privateOutput = null, PrivateOrdinalBuffer? privateInput = null)
     {
         _rd = rd; _routes = plan.Routes; _privateOutput = privateOutput;
+        _headerReadback = new(rd, FamilyGpuHeaderReadback.Requested);
         _privateInput=privateInput is not null; _privateInputBuffer=privateInput;
         if (_privateInput && ReferenceEquals(privateInput,privateOutput)) throw new ArgumentException("C.PrivateBuffersAlias");
         var watch = Stopwatch.StartNew();
@@ -44,6 +48,7 @@ internal sealed class CombatRewardGpuExecutor : IDisposable
                 if(!source.Contains(read,StringComparison.Ordinal))throw new InvalidOperationException("C.PrivateInputSeamChanged");
                 source=source.Replace(read,"input_ordinals.values[batch_meta.values[6]+index]",StringComparison.Ordinal);
             }
+            _visibleSeedCache = SharedVisibleSeedGpuCache.Attach(rd, _owned, ref source, ref buffers, "C.CombatReward");
             Rid shader=Add(FamilyGpuComputeUtility.CompileShader(rd,source,"CombatRewardFamily"));
             _pipeline=Add(FamilyGpuComputeUtility.CreateComputePipeline(rd, shader, "C.CombatReward"));
             if(!rd.ComputePipelineIsValid(_pipeline))throw new InvalidOperationException("C.GpuPipelineInvalid");
@@ -100,6 +105,11 @@ internal sealed class CombatRewardGpuExecutor : IDisposable
         if (resident && !input.IsDense) throw new InvalidOperationException("C.PrivateDenseOnly");
         var watch=Stopwatch.StartNew(); var survivors=new List<ulong>();
         double upload=0,sync=0,read=0,widen=0; long bytes=0; int dispatches=0;
+        if (_visibleSeedCache is not null)
+        {
+            _visibleSeedCache.Refresh(input.Batch);
+            upload += watch.Elapsed.TotalMilliseconds;
+        }
         if (resident) FamilyGpuComputeUtility.Update(_rd,_header,Header(),"C.PrivateHeader");
         for(int offset=0;offset<inputCount;offset+=Capacity)
         {
@@ -123,11 +133,19 @@ internal sealed class CombatRewardGpuExecutor : IDisposable
                 _rd.ComputeListBindComputePipeline(list,_pipeline);_rd.ComputeListBindUniformSet(list,_uniforms,0);
                 _rd.ComputeListDispatch(list,(uint)((count+63)/64),1,1);
             } finally { _rd.ComputeListEnd(); }
-            FamilyGpuComputeUtility.SubmitAndSync(_rd, "C.CombatReward");dispatches++;
+            bool needsHeader = !resident || offset + count == inputCount;
+            double completionStart = watch.Elapsed.TotalMilliseconds;
+            uint[]? header = needsHeader
+                ? _headerReadback.CompleteRecorded(_header, 8, true, "C.CombatReward", static () => { }) : null;
+            if (!needsHeader) FamilyGpuComputeUtility.SubmitAndSync(_rd, "C.CombatReward");
+            double headerTransportMs = needsHeader ? Math.Max(0, watch.Elapsed.TotalMilliseconds - completionStart -
+                _headerReadback.LastSubmitMs - _headerReadback.LastSyncMs) : 0;
+            dispatches++;
             sync+=watch.Elapsed.TotalMilliseconds-start;
-            if (resident && offset + count < inputCount) continue;
+            sync -= headerTransportMs; read += headerTransportMs;
+            if (!needsHeader) continue;
             token.ThrowIfCancellationRequested();start=watch.Elapsed.TotalMilliseconds;
-            uint[] header=FamilyGpuComputeUtility.FromUInt32Bytes(_rd.BufferGetData(_header));
+            if (header is null) throw new InvalidDataException("C.MissingCompletedHeader");
             if(header.Length!=8||header[0]!=0x43464d52||header[1]!=1||header[5]!=0x43463031||
                 header[3]!=0||header[4]!=(resident?inputCount:count)||header[2]>(resident?inputCount:count))
                 throw new InvalidDataException("C.GpuHeaderOrNumericFailure:"+string.Join(',',header));

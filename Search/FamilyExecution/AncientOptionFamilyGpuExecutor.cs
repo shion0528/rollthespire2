@@ -7,8 +7,11 @@ internal readonly record struct AncientOptionFamilyGpuMetrics(int Input, int Out
 internal sealed class AncientOptionFamilyGpuExecutor : IDisposable
 {
     private readonly RenderingDevice _rd;
+    private readonly FamilyGpuHeaderReadback _headerReadback;
+    internal string HeaderReadbackRevision => _headerReadback.Revision;
     private readonly List<Rid> _owned = [];
     private readonly Rid _batch, _input, _header, _output, _pipeline, _uniforms;
+    private readonly SharedVisibleSeedGpuCache? _visibleSeedCache;
     private readonly int _owner = System.Environment.CurrentManagedThreadId;
     private bool _disposed;
     private readonly bool _privateInput, _privateOutput;
@@ -23,6 +26,7 @@ internal sealed class AncientOptionFamilyGpuExecutor : IDisposable
         _privateInput = privateInput is not null; _privateOutput = privateOutput is not null;
         if (_privateInput && ReferenceEquals(privateInput, privateOutput)) throw new ArgumentException("A.PrivateBuffersAlias");
         _rd = rd; Capacity = plan.Capacity; var watch = Stopwatch.StartNew();
+        _headerReadback = new(rd, FamilyGpuHeaderReadback.Requested);
         Rid Add(Rid r) { _owned.Add(r); return r; }
         Rid Data(uint[] data) => Add(FamilyGpuComputeUtility.CreateStorageBuffer(rd, FamilyGpuComputeUtility.ToBytesNonEmpty(data)));
         try
@@ -43,11 +47,13 @@ internal sealed class AncientOptionFamilyGpuExecutor : IDisposable
                     throw new InvalidOperationException("A.PrivateInputShaderSeam");
                 source = source.Replace(address, "input_ids.v[batch.v[6]+i]", StringComparison.Ordinal);
             }
+            _visibleSeedCache = SharedVisibleSeedGpuCache.Attach(rd, _owned, ref source, ref buffers, "A.AncientOption");
             Rid shader = Add(FamilyGpuComputeUtility.CompileShader(rd, source, "AncientOptionFamily"));
             _pipeline = Add(FamilyGpuComputeUtility.CreateComputePipeline(rd, shader, "A.AncientOption"));
             if (!rd.ComputePipelineIsValid(_pipeline)) throw new InvalidOperationException("A.AncientOption.PipelineInvalid");
             _uniforms = Add(FamilyGpuComputeUtility.CreateUniformSet(rd, shader, buffers, "A.AncientOption"));
-            WorkspaceBytes = 64 + Capacity * 8L + plan.Buffers.Sum(b => Math.Max(4, b.Length * 4L)) + Math.Max(4, Capacity * plan.ScratchWords * 4L);
+            WorkspaceBytes = 64 + Capacity * 8L + plan.Buffers.Sum(b => Math.Max(4, b.Length * 4L)) + Math.Max(4, Capacity * plan.ScratchWords * 4L) +
+                (_visibleSeedCache is null ? 0 : SharedVisibleSeedGpuCache.Bytes);
             Device = rd.GetDeviceName(); SetupMs = watch.Elapsed.TotalMilliseconds;
         }
         catch (Exception failure)
@@ -80,6 +86,7 @@ internal sealed class AncientOptionFamilyGpuExecutor : IDisposable
     {
         Check(); token.ThrowIfCancellationRequested();
         var watch = Stopwatch.StartNew(); var survivors = new List<ulong>(); int dispatches = 0; long bytes = 0; double read = 0;
+        _visibleSeedCache?.Refresh(input.Batch);
         double dispatchMs = 0; int privateCount = 0;
         if (_privateOutput) FamilyGpuComputeUtility.Update(_rd, _header, Header(), "A.PrivateHeader");
         for (int offset = 0; offset < inputCount; offset += Capacity)
@@ -104,10 +111,19 @@ internal sealed class AncientOptionFamilyGpuExecutor : IDisposable
                 _rd.ComputeListDispatch(list, (uint)((count + 63) / 64), 1, 1);
             }
             finally { _rd.ComputeListEnd(); }
-            FamilyGpuComputeUtility.SubmitAndSync(_rd, "A.AncientOption"); dispatches++;
+            bool needsHeader = !_privateOutput || offset + count == inputCount;
+            double completionStart = watch.Elapsed.TotalMilliseconds;
+            uint[]? h = needsHeader
+                ? _headerReadback.CompleteRecorded(_header, 8, true, "A.AncientOption", static () => { }) : null;
+            if (!needsHeader) FamilyGpuComputeUtility.SubmitAndSync(_rd, "A.AncientOption");
+            double headerTransportMs = needsHeader ? Math.Max(0, watch.Elapsed.TotalMilliseconds - completionStart -
+                _headerReadback.LastSubmitMs - _headerReadback.LastSyncMs) : 0;
+            dispatches++;
             dispatchMs += watch.Elapsed.TotalMilliseconds - dispatchStart;
+            dispatchMs -= headerTransportMs; read += headerTransportMs;
+            if (!needsHeader) continue;
             token.ThrowIfCancellationRequested(); double start = watch.Elapsed.TotalMilliseconds;
-            uint[] h = FamilyGpuComputeUtility.FromUInt32Bytes(_rd.BufferGetData(_header));
+            if (h is null) throw new InvalidDataException("A.AncientOption.MissingCompletedHeader");
             int processed = _privateOutput ? offset + count : count;
             if (h.Length != 8 || h[0] != 0x414f4652u || h[1] != 1 || h[5] != 0x414f4652u || h[3] != 0 || h[4] != processed || h[2] > processed)
                 throw new InvalidDataException($"A.AncientOption.HeaderFault:batch={input.Batch.BatchBase};offset={offset};header={string.Join(',', h)}");

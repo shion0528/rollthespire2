@@ -19,6 +19,9 @@ public static partial class FamilyExecutionCoordinator
 {
     internal static FamilyExecutionPlan Plan(ExactSearchExecutionRequest plan, bool? gpuAvailable = null)
     {
+        ArgumentNullException.ThrowIfNull(plan);
+        using var optimizationScope = SearchOptimizationScope.Enter(plan.RunOptions.Optimizations);
+        if (plan.RunOptions.Resources?.GpuPercent == 0) gpuAvailable = false;
         using var logScope = RuntimeLog.PlanningScope();
         var registered = CreateRegisteredFamilies(plan, gpuAvailable);
         if (plan.CompiledSearch.Context.Party is not null) return PlanParty(plan, registered);
@@ -73,7 +76,12 @@ public static partial class FamilyExecutionCoordinator
         bool failOnPhysicalRecovery = false,
         bool? gpuAvailable = null)
     {
+        ArgumentNullException.ThrowIfNull(plan);
+        if (diagnosticSink is not null || !string.IsNullOrWhiteSpace(traceSingleCandidateSeed))
+            plan = plan with { RunOptions = plan.RunOptions with { IncludeDiagnostics = true } };
+        using var optimizationScope = SearchOptimizationScope.Enter(plan.RunOptions.Optimizations);
         using var logScope = RuntimeLog.SearchScope(RuntimeLog.SessionId.Length > 0 ? RuntimeLog.SessionId : Guid.NewGuid().ToString("N"));
+        if (plan.RunOptions.Resources?.GpuPercent == 0) gpuAvailable = false;
         // A failed search is never silently restarted on CPU. The user can retry
         // creation explicitly, or choose the existing CPU resource constraint.
         if (gpuAvailable != false)
@@ -96,9 +104,12 @@ public static partial class FamilyExecutionCoordinator
 
     internal static int ResolveExecutionWindowSize(ExactSearchExecutionRequest plan, IReadOnlyList<IFamilyInvocation> families)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(plan.RunOptions.Optimizations);
         if (plan.CompiledSearch.Context.Party is not null) return families.Any(f => f.ConditionPerformance.UsesGpu)
             ? FamilyPhysicalExecutionDefaults.DefaultCandidateBatchSize : FamilyCpuExecution.Capacity;
         if (families.Count > 0 && families.All(f=>f is FamilyCpuExecution)) return 65536;
+        if (families.Count == 1 && families[0] is NeowFamily { SupportsDenseWindowBatching: true } neow)
+            return neow.PreferredDenseWindowSize;
         MerchantShopColorlessFamily? shop = families.OfType<MerchantShopColorlessFamily>().SingleOrDefault();
         RelicFamily? relic = families.OfType<RelicFamily>().SingleOrDefault();
 
@@ -118,6 +129,7 @@ public static partial class FamilyExecutionCoordinator
     internal static IReadOnlyList<IFamilyInvocation> CreateRegisteredFamilies(ExactSearchExecutionRequest plan, bool? gpuAvailable = null)
     {
         ArgumentNullException.ThrowIfNull(plan);
+        using var optimizationScope = SearchOptimizationScope.Enter(plan.RunOptions.Optimizations);
         return plan.CompiledSearch.Context.Party is not null
             ? CreatePartyFamilies(plan, gpuAvailable ?? FamilyDeviceProfileFoundation.GpuAvailable)
             : CreateSingleplayerFamilies(plan);

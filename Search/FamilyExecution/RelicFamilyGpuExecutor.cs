@@ -54,6 +54,8 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
     private const string RfullFilterMarker = "/*__RT2_RFULL_FILTER__*/";
 
     private readonly RenderingDevice _rd;
+    private readonly FamilyGpuHeaderReadback _headerReadback;
+    internal string HeaderReadbackRevision => _headerReadback.Revision;
     private readonly List<Rid> _owned = new();
     private readonly Rid _pipeline;
     private readonly Rid _batchMeta;
@@ -69,6 +71,7 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
     internal uint LastEarlyHeavy { get; private set; }
     internal uint LastLateHeavy { get; private set; }
     private PrivateOrdinalBuffer? _privateInput, _privateOutput;
+    private SharedVisibleSeedGpuCache? _prefixCache;
     private bool _bonesKBoundary;
     internal uint LastEarlyPass { get; private set; }
     internal uint LastLatePass { get; private set; }
@@ -89,6 +92,7 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
         long workspaceBytes)
     {
         _rd = rd;
+        _headerReadback = new(rd, FamilyGpuHeaderReadback.Requested);
         _pipeline = pipeline;
         _batchMeta = batchMeta;
         _inputOrdinals = inputOrdinals;
@@ -209,6 +213,9 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
                 source = source.Replace(reject, string.Empty, StringComparison.Ordinal)
                     .Replace(bounds, "if (logical >= batch_meta.values[2u]) { atomicExchange(output_header.values[3u],2u); return; } " + reject, StringComparison.Ordinal);
             }
+            var prefixCache = SharedVisibleSeedGpuCache.Attach(rd, owned, ref source, buffers,
+                fullPlan is null ? "R.Relic" : "R.RelicFull");
+            if (prefixCache is not null) workspaceBytes = checked(workspaceBytes + SharedVisibleSeedGpuCache.Bytes);
             Rid shader = Add(FamilyGpuComputeUtility.CompileShader(rd, source, fullPlan is null ? "RelicFamilyR" : "RelicFamilyRfull"));
             Rid pipeline = Add(FamilyGpuComputeUtility.CreateComputePipeline(rd, shader, fullPlan is null ? "R.Relic" : "R.RelicFull"));
             if (!rd.ComputePipelineIsValid(pipeline)) throw new InvalidOperationException("RFamilyGpuPipelineInvalid");
@@ -220,6 +227,7 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
                 planTag, Thread.CurrentThread.ManagedThreadId, timer.Elapsed.TotalMilliseconds,
                 rd.GetDeviceName()?.Trim() ?? "unknown", workspaceBytes);
             result._privateInput = privateInput; result._privateOutput = privateOutput;
+            result._prefixCache = prefixCache;
             result._bonesKBoundary = fullPlan?.UsesBonesKBoundary == true;
             result._owned.AddRange(owned);
             owned.Clear();
@@ -283,9 +291,12 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
         out RelicFamilyGpuBatchMetrics metrics)
     {
         if (_privateInput is not null || _privateOutput is not null) throw new InvalidOperationException("R.PrivateTransportRequiresPrivateEntry");
-        if (!input.IsDense && input.Count > CompactInputCapacity && input.Count <= Capacity)
-            return ExecutePublicCompactWindows(input, cancellationToken, out metrics);
-        return ExecuteCore(input, input.Count, cancellationToken, out metrics)!;
+        double prefixUploadMs = RefreshPrefixCache(input.Batch, input.Count, cancellationToken);
+        FamilyCandidateSet result = !input.IsDense && input.Count > CompactInputCapacity && input.Count <= Capacity
+            ? ExecutePublicCompactWindows(input, cancellationToken, out metrics)
+            : ExecuteCore(input, input.Count, cancellationToken, out metrics)!;
+        metrics = IncludePrefixUpload(metrics, prefixUploadMs);
+        return result;
     }
 
     internal FamilyCandidateSet ExecutePrivate(SearchBatch batch, int count, CancellationToken token,
@@ -293,7 +304,10 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
     {
         if (_privateInput is null || _privateOutput is not null) throw new InvalidOperationException("R.PrivateTerminalPortsRequired");
         _privateInput.CheckPopulation(batch, count);
-        return ExecuteCore(FamilyCandidateSet.Dense(batch), count, token, out metrics)!;
+        double prefixUploadMs = RefreshPrefixCache(batch, count, token);
+        FamilyCandidateSet result = ExecuteCore(FamilyCandidateSet.Dense(batch), count, token, out metrics)!;
+        metrics = IncludePrefixUpload(metrics, prefixUploadMs);
+        return result;
     }
 
     internal int ExecutePrivateStage(SearchBatch batch, int count, CancellationToken token, out RelicFamilyGpuBatchMetrics metrics)
@@ -301,9 +315,29 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
         if (_privateOutput is null || (_privateInput is null && count != batch.BatchCandidateCount)) throw new InvalidOperationException("R.PrivateStagePortsRequired");
         _privateOutput.CheckPopulation(batch, count);
         _privateInput?.CheckPopulation(batch, count);
+        double prefixUploadMs = RefreshPrefixCache(batch, count, token);
         ExecuteCore(FamilyCandidateSet.Dense(batch), count, token, out metrics);
+        metrics = IncludePrefixUpload(metrics, prefixUploadMs);
         return metrics.Survivors;
     }
+
+    private double RefreshPrefixCache(SearchBatch batch, int count, CancellationToken token)
+    {
+        AssertOwnerThread();
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        token.ThrowIfCancellationRequested();
+        if (_prefixCache is null || count == 0) return 0d;
+        var timer = Stopwatch.StartNew();
+        _prefixCache.Refresh(batch);
+        return timer.Elapsed.TotalMilliseconds;
+    }
+
+    private static RelicFamilyGpuBatchMetrics IncludePrefixUpload(RelicFamilyGpuBatchMetrics metrics, double elapsedMs) =>
+        metrics with
+        {
+            MetadataUploadMs = metrics.MetadataUploadMs + elapsedMs,
+            CanonicalAbi1ReadyMs = metrics.CanonicalAbi1ReadyMs + elapsedMs
+        };
 
     private FamilyCandidateSet? ExecuteCore(FamilyCandidateSet input, int inputCount,
         CancellationToken cancellationToken, out RelicFamilyGpuBatchMetrics metrics)
@@ -382,12 +416,16 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
         finally { _rd.ComputeListEnd(); }
         timer.Stop();
         double commandMs = timer.Elapsed.TotalMilliseconds;
-        (double submitMs, double syncMs) = FamilyGpuComputeUtility.SubmitAndSync(_rd, "R.Relic");
+        timer.Restart();
+        uint[] header = _headerReadback.CompleteRecorded(_outputHeader, checked((uint)ActiveHeaderUIntCount),
+            true, "R.Relic", static () => { });
+        timer.Stop();
+        double submitMs = _headerReadback.LastSubmitMs, syncMs = _headerReadback.LastSyncMs;
+        double headerTransportMs = Math.Max(0, timer.Elapsed.TotalMilliseconds - submitMs - syncMs);
         cancellationToken.ThrowIfCancellationRequested();
 
         timer.Restart();
-        byte[] rawHeader = _rd.BufferGetData(_outputHeader, 0u, checked((uint)ActiveHeaderUIntCount * sizeof(uint)));
-        uint[] header = FamilyGpuComputeUtility.FromUInt32Bytes(rawHeader);
+        long headerReadBytes = (long)header.Length * sizeof(uint);
         int processedCount = ValidateHeader(header, inputCount);
         LastEarlyHeavy = header[6]; LastLateHeavy = header[7];
         if (_bonesKBoundary) { LastEarlyPass = header[8]; LastLatePass = header[9]; LastRouteA=header[10]; LastRouteB=header[11]; }
@@ -413,7 +451,7 @@ internal sealed partial class RelicFamilyGpuExecutor : IDisposable
             compactPackAllocationMs, compactPackConvertValidateMs, compactPackAllocatedBytes,
             compactUploadStagingMs, compactUploadStagingAllocatedBytes, compactBufferUpdateMs,
             commandMs, submitMs, syncMs,
-            timer.Elapsed.TotalMilliseconds, rawHeader.LongLength + rawOrdinals.LongLength,
+            headerTransportMs + timer.Elapsed.TotalMilliseconds, headerReadBytes + rawOrdinals.LongLength,
             canonicalTimer.Elapsed.TotalMilliseconds);
         return result;
     }

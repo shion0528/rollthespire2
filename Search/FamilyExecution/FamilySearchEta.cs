@@ -112,6 +112,38 @@ internal static class FamilySearchEtaProjectorV1
         double? liveExactMsPerAttempt = null)
     {
         ArgumentNullException.ThrowIfNull(request);
+        using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
+        var projection = ProjectCore(request, plan, livePerformanceByPhysicalRevision, liveExactMsPerAttempt);
+        if (request.RunOptions.Resources?.GpuPercent is not (> 0 and < 100) ||
+            !plan.Stages.Any(stage => stage.Family.ConditionPerformance.UsesGpu)) return projection;
+        // Canonical GPU timings exclude the outer duty-cycle waits. A mixed
+        // CPU/GPU pipeline cannot be corrected by scaling its whole duration;
+        // retain probability evidence until measured wall throughput is available.
+        return projection with
+        {
+            Status = projection.Status == FamilySearchEtaStatus.Impossible
+                ? FamilySearchEtaStatus.Impossible : FamilySearchEtaStatus.Calibrating,
+            FirstResultMeanMs = null,
+            FirstResultP99Ms = null,
+            TargetMeanMs = null,
+            FixedScanRangeMs = null,
+            TargetFamilyPipelineMs = null,
+            TargetExactTailMs = null,
+            FirstResultSearchMeanMs = null,
+            FirstResultSearchP99Ms = null,
+            TargetSearchMeanMs = null,
+            TargetStages = projection.TargetStages.Select(stage => stage with { SteadyStateMs = null }).ToArray(),
+            MissingEvidence = Distinct(projection.MissingEvidence.Append("GpuDutyCycleRequiresObservedWallRate"))
+        };
+    }
+
+    private static FamilySearchEtaProjectionV1 ProjectCore(
+        ExactSearchExecutionRequest request,
+        FamilyExecutionPlan plan,
+        IReadOnlyDictionary<string, double>? livePerformanceByPhysicalRevision,
+        double? liveExactMsPerAttempt)
+    {
+        ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(plan);
         int targetCount = Math.Max(1, request.TargetMatchCount);
         JointSelectivityResult joint = JointSelectivityEstimator.EstimateQuery(SearchSelectivityInput.From(request));
@@ -388,8 +420,57 @@ internal static class FamilyExactTimingDomains
 
     internal static SearchVerificationFamily Resolve(ExactSearchExecutionRequest request)
     {
+        var family = ResolveProjectionFamily(request);
+        // IncludeDiagnostics:false also avoids the request-context diagnostic
+        // records and flattened per-domain arrays outside the Boss projection.
+        // That CPU workload must not consume or overwrite the old full-output
+        // timing evidence, including whole-party Exact envelopes.
+        return request.IncludeDiagnostics ? family : WithoutDiagnostics(family);
+    }
+
+    internal static SearchVerificationFamily WithoutDiagnostics(SearchVerificationFamily family) => family switch
+    {
+        SearchVerificationFamily.NeowOnly => SearchVerificationFamily.NeowOnlyNoDiagnosticsV1,
+        SearchVerificationFamily.RelicOnly => SearchVerificationFamily.RelicOnlyNoDiagnosticsV1,
+        SearchVerificationFamily.WorldOnly => SearchVerificationFamily.WorldOnlyNoDiagnosticsV1,
+        SearchVerificationFamily.CombatRewardOnly => SearchVerificationFamily.CombatRewardOnlyNoDiagnosticsV1,
+        SearchVerificationFamily.MixedWithoutReward => SearchVerificationFamily.MixedWithoutRewardNoDiagnosticsV1,
+        SearchVerificationFamily.MixedWithReward => SearchVerificationFamily.MixedWithRewardNoDiagnosticsV1,
+        SearchVerificationFamily.MapOnly => SearchVerificationFamily.MapOnlyNoDiagnosticsV1,
+        SearchVerificationFamily.MapMixedWithoutReward => SearchVerificationFamily.MapMixedWithoutRewardNoDiagnosticsV1,
+        SearchVerificationFamily.MapMixedWithReward => SearchVerificationFamily.MapMixedWithRewardNoDiagnosticsV1,
+        SearchVerificationFamily.Party2 => SearchVerificationFamily.Party2NoDiagnosticsV1,
+        SearchVerificationFamily.Party3 => SearchVerificationFamily.Party3NoDiagnosticsV1,
+        SearchVerificationFamily.Party4 => SearchVerificationFamily.Party4NoDiagnosticsV1,
+        SearchVerificationFamily.Party2Map => SearchVerificationFamily.Party2MapNoDiagnosticsV1,
+        SearchVerificationFamily.Party3Map => SearchVerificationFamily.Party3MapNoDiagnosticsV1,
+        SearchVerificationFamily.Party4Map => SearchVerificationFamily.Party4MapNoDiagnosticsV1,
+        SearchVerificationFamily.Party2Reward => SearchVerificationFamily.Party2RewardNoDiagnosticsV1,
+        SearchVerificationFamily.Party3Reward => SearchVerificationFamily.Party3RewardNoDiagnosticsV1,
+        SearchVerificationFamily.Party4Reward => SearchVerificationFamily.Party4RewardNoDiagnosticsV1,
+        SearchVerificationFamily.Party2MapReward => SearchVerificationFamily.Party2MapRewardNoDiagnosticsV1,
+        SearchVerificationFamily.Party3MapReward => SearchVerificationFamily.Party3MapRewardNoDiagnosticsV1,
+        SearchVerificationFamily.Party4MapReward => SearchVerificationFamily.Party4MapRewardNoDiagnosticsV1,
+        // These revisioned families already imply the non-diagnostic projection.
+        SearchVerificationFamily.WorldBossOutputDemandV1 or
+        SearchVerificationFamily.MixedBossOutputDemandWithoutRewardV1 or
+        SearchVerificationFamily.MixedBossOutputDemandWithRewardV1 => family,
+        _ => throw new ArgumentOutOfRangeException(nameof(family), family, "UnclassifiedExactDiagnosticsWorkload")
+    };
+
+    private static SearchVerificationFamily ResolveProjectionFamily(ExactSearchExecutionRequest request)
+    {
         if (request.CompiledSearch.Context.Party is not { } party)
         {
+            // The query-scoped Exact document has a different CPU workload from
+            // the historical all-World predictor. Never reuse or overwrite its
+            // timing samples; Family replay calibration is unchanged.
+            if (ExactWorldProjectionPolicy.Resolve(request) == Core.World.WorldPredictionProjection.BossIdentityOnly)
+                return QueryDomains(request).Length == 1
+                    ? SearchVerificationFamily.WorldBossOutputDemandV1
+                    : request.Evaluation.RequiresNormalCombatRewardDomain
+                        ? SearchVerificationFamily.MixedBossOutputDemandWithRewardV1
+                        : SearchVerificationFamily.MixedBossOutputDemandWithoutRewardV1;
             if (request.CompiledSearch.NormalizedQuery.StandardMaps.Count > 0)
                 return StandardMapExactCost.MapOnly(request.CompiledSearch.NormalizedQuery)
                     ? SearchVerificationFamily.MapOnly

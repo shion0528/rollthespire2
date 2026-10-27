@@ -282,6 +282,19 @@ uint64_t xxhash64_seed12_packed(uint64_t first8, uint tail4) {
     return hash;
 }
 
+// Same suffix and avalanche as xxhash64_seed12_packed. The host table supplies
+// its exact first8 hash state, not an approximation or a different seed hash.
+uint64_t xxhash64_seed12_from_prefix(uint64_t prefix_hash, uint tail4) {
+    uint64_t hash = prefix_hash ^ (uint64_t(tail4) * prime1());
+    hash = rotl64(hash, 23u) * prime2() + prime3();
+    hash ^= hash >> 33u;
+    hash *= prime2();
+    hash ^= hash >> 29u;
+    hash *= prime3();
+    hash ^= hash >> 32u;
+    return hash;
+}
+
 uint64_t root_hash_for_ordinal(uint64_t ordinal) {
     uint64_t first8;
     uint tail4;
@@ -330,6 +343,50 @@ void advance_seed12_packed(inout uint64_t first8, inout uint tail4) {
     if (!advance_seed_byte64(first8, 8u)) return;
     advance_seed_byte64(first8, 0u);
 }
+
+#if RT2_PREFIX_HASH_CACHE && N_STAGE == 0
+const uint PREFIX_HASH_BLOCK_SIZE = 1336336u;
+uint encode_seed4_packed(uint ordinal) {
+    uint d3=ordinal%34u; ordinal/=34u;
+    uint d2=ordinal%34u; ordinal/=34u;
+    uint d1=ordinal%34u; ordinal/=34u;
+    return alphabet_byte(ordinal) | (alphabet_byte(d1)<<8u) |
+           (alphabet_byte(d2)<<16u) | (alphabet_byte(d3)<<24u);
+}
+uint64_t prefix_hash_cache_load(uint row) {
+    uint at=4u+row*4u;
+    return make_u64(prefix_hash_cache_value(at),prefix_hash_cache_value(at+1u));
+}
+bool prefix_hash_cache_initialize(uint first, out uint row, out uint suffix_ordinal,
+    out uint tail4, out uint64_t prefix_hash) {
+    // The host limits each workspace to 2^24 roots: this sum fits uint. One
+    // 32-bit constant division per eight roots replaces full 64-bit decoding.
+    uint position=prefix_hash_cache_value(0u)+first;
+    row=position/PREFIX_HASH_BLOCK_SIZE;
+    suffix_ordinal=position-row*PREFIX_HASH_BLOCK_SIZE;
+    tail4=encode_seed4_packed(suffix_ordinal);
+    prefix_hash=uint64_t(0u);
+    if(row>=prefix_hash_cache_value(1u))return false;
+    prefix_hash=prefix_hash_cache_load(row);
+    return true;
+}
+bool prefix_hash_cache_advance(inout uint row, inout uint suffix_ordinal,
+    inout uint tail4, inout uint64_t prefix_hash) {
+    suffix_ordinal++;
+    if(suffix_ordinal==PREFIX_HASH_BLOCK_SIZE) {
+        suffix_ordinal=0u; row++;
+        if(row>=prefix_hash_cache_value(1u))return false;
+        prefix_hash=prefix_hash_cache_load(row);
+        tail4=0x30303030u;
+        return true;
+    }
+    if(!advance_seed_byte32(tail4,24u))return true;
+    if(!advance_seed_byte32(tail4,16u))return true;
+    if(!advance_seed_byte32(tail4,8u))return true;
+    advance_seed_byte32(tail4,0u);
+    return true;
+}
+#endif
 
 uint64_t identity_permutation(uint length) {
     uint64_t packed = uint64_t(0u);

@@ -1,5 +1,6 @@
 using RolltheSpire2.Core.Diagnostics;
 using RolltheSpire2.Search.Runtime;
+using RolltheSpire2.Search.Contracts;
 
 namespace RolltheSpire2.Ui.Settings;
 
@@ -9,7 +10,18 @@ namespace RolltheSpire2.Ui.Settings;
 /// </summary>
 internal sealed class RuntimePredictionSettings
 {
-    private int _searchWorkerCount = 4;
+    private int _searchWorkerCount = new SearchResourceBudget().ResolveCpuWorkers(System.Environment.ProcessorCount);
+    private SearchResourceBudget _resources = new();
+
+    public SearchResourceBudget Resources
+    {
+        get => _resources;
+        set
+        {
+            _resources = value.Normalize();
+            _searchWorkerCount = _resources.ResolveCpuWorkers(System.Environment.ProcessorCount);
+        }
+    }
 
     public bool EnableComplexBonesDeckInteractions { get; set; }
 

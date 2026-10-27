@@ -38,7 +38,11 @@ internal sealed partial class QueryWorkbenchFrame
         _planSelector.Select(_persistence.Preferences.SearchMode == "CPU" ? 1 : 0);
         _planSelector.ItemSelected += index => { _persistence.SetWorkbenchSearchMode(index == 1 ? "CPU" : "Auto"); _analysisKey = ""; };
         _start = _p.Button(_text.Get("query.action.start"), primary: true); _start.CustomMinimumSize = new(0, 46);
-        _start.Pressed += () => { if (_session is not null) _session.Cancel(); else StartSearch(); }; sidebar.AddChild(_start);
+        _start.Pressed += () => { if (_session is not null) PauseSearch(); else StartSearch(); }; sidebar.AddChild(_start);
+        _checkpointLabel = _p.Label("", 14, true);
+        _checkpointLabel.Name = "SearchCheckpoint";
+        _checkpointLabel.AutowrapMode = TextServer.AutowrapMode.WordSmart;
+        sidebar.AddChild(_checkpointLabel);
         _savedResultsEntry = _p.CompactButton("", 44, 18, selected: true);
         _savedResultsEntry.Name = "ViewLastSearchResults";
         _savedResultsEntry.Pressed += ShowLastResults;

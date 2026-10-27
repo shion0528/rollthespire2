@@ -34,8 +34,12 @@ public enum SeedPredictionRequestError
 
 public sealed class SeedPredictionRequest
 {
+    // Set only by Production Exact after its query-demand proof. Public requests
+    // and ordinary single-seed analysis always start with the full document.
+    internal WorldPredictionProjection WorldProjection { get; set; } = WorldPredictionProjection.All;
     // Root-local party replay supplies the actual opening choices to the existing information pipeline.
     internal IReadOnlyList<NeowChoiceResult>? PartyOpeningChoices { get; set; }
+    internal PreparedCombatRewardPools? PreparedRewardPools { get; set; }
     // Legacy result envelope metadata only. The party projector owns its observation;
     // this does not invoke the single-player analysis pipeline or inherit its UI cap.
     internal static SeedPredictionRequest ForPartyInitialInformation(TrustedRootHashInput input, OrderedPartyAuthority party, bool diagnostics)
@@ -108,7 +112,7 @@ public sealed class SeedPredictionRequest
         IncludeDiagnostics,
         enabled,
         TrustedRootHashInput,
-        CombatRewardProjectionRequest) { PartyOpeningChoices = PartyOpeningChoices };
+        CombatRewardProjectionRequest) { PartyOpeningChoices = PartyOpeningChoices, WorldProjection = WorldProjection, PreparedRewardPools = PreparedRewardPools };
 
     public bool Includes(SeedPredictionDomainSelection domain) => (Domains & domain) == domain;
 
@@ -118,7 +122,7 @@ public sealed class SeedPredictionRequest
         PredictionRequestId.Create(), OriginalSeed, Character, Ascension, PlayersCount, PlayerSlotIndex,
         Authority, conditions, Domains, RelicSequencePreviewCount, IncludeDiagnostics,
         EnableComplexBonesDeckInteractions, TrustedRootHashInput, CombatRewardProjectionRequest)
-        { PartyOpeningChoices = PartyOpeningChoices };
+        { PartyOpeningChoices = PartyOpeningChoices, WorldProjection = WorldProjection, PreparedRewardPools = PreparedRewardPools };
 
     public static bool TryCreate(
         string? originalSeed,

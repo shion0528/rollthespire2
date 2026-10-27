@@ -4,6 +4,7 @@ using System.Text;
 using RolltheSpire2.Compatibility;
 using RolltheSpire2.Core.Prediction;
 using RolltheSpire2.Core.Identity;
+using RolltheSpire2.Core.Rewards;
 using RolltheSpire2.Search.Contracts;
 using RolltheSpire2.Search.FamilyExecution;
 using RolltheSpire2.Search.Semantics;
@@ -69,6 +70,15 @@ public static class ExactSearchExecutionRequestFactory
         if (runOptions.ScanCount <= 0) return Reject(SearchDisposition.Unsupported, "ScanCountMustBePositive");
         if (runOptions.TargetMatchCount <= 0) return Reject(SearchDisposition.Unsupported, "TargetMatchCountMustBePositive");
         if (runOptions.WorkerCount is < 1 or > 64) return Reject(SearchDisposition.Unsupported, "WorkerCountOutsideSupportedRange");
+        if (runOptions.Resources is { } resources)
+        {
+            if (resources != resources.Normalize())
+                return Reject(SearchDisposition.Unsupported, "ResourceBudgetOutsideSupportedRange");
+            runOptions = runOptions with
+            {
+                WorkerCount = Math.Min(runOptions.WorkerCount, resources.ResolveCpuWorkers(Environment.ProcessorCount))
+            };
+        }
         if (!profile.TryCanonicalizeSeed(runOptions.StartSeed, out string canonicalStart, out string seedIssue))
             return Reject(SearchDisposition.Unsupported, "InvalidStartSeed:" + seedIssue);
 
@@ -109,8 +119,30 @@ public static class ExactSearchExecutionRequestFactory
             canonicalStart, resolvedScanCount.ToString(), runOptions.TargetMatchCount.ToString(),
             runOptions.WorkerCount.ToString(), rewardPolicy.ExactPolicy.ToString()
         });
-        return ExactSearchExecutionCompileResult.Accepted(new ExactSearchExecutionRequest(
-            compiled, runOptions, canonicalStart, resolvedScanCount, evaluation, rewardPolicy, fingerprint));
+        var request = new ExactSearchExecutionRequest(
+            compiled, runOptions, canonicalStart, resolvedScanCount, evaluation, rewardPolicy, fingerprint);
+        return ExactSearchExecutionCompileResult.Accepted(PrepareRewardPools(request));
+    }
+
+    private static ExactSearchExecutionRequest PrepareRewardPools(ExactSearchExecutionRequest request)
+    {
+        // ForPlayer is deliberately not prepared: it is invoked during party
+        // candidate replay rather than at a once-per-session compile boundary.
+        if (!request.Evaluation.RequiresNormalCombatRewardDomain || !request.RunOptions.Optimizations.CostOrderedFilters ||
+            request.CompiledSearch.Context.Party is not null || request.Authority.PlayersCount != 1)
+            return request;
+        var pools = PreparedCombatRewardPools.TryCreate(request.ProfileId,
+            request.Authority.EffectAuthority, request.Authority.WorldAuthority);
+        if (pools is null) return request;
+        var ownedAuthority = request.Authority.WithEffectAuthority(pools.OwnedAuthority);
+        return request with
+        {
+            CompiledSearch = request.CompiledSearch with
+            {
+                Context = request.CompiledSearch.Context with { Authority = ownedAuthority }
+            },
+            PreparedRewardPools = pools
+        };
     }
 
     private static ExactSearchExecutionCompileResult Reject(SearchDisposition disposition, string issue) =>

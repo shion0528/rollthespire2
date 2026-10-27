@@ -2,6 +2,7 @@ using Godot;
 using RolltheSpire2.Bootstrap;
 using RolltheSpire2.Compatibility;
 using RolltheSpire2.Presentation.Localization;
+using RolltheSpire2.Search.Contracts;
 
 namespace RolltheSpire2.Ui.Shell;
 
@@ -25,6 +26,10 @@ internal sealed partial class WorkspaceShell
     private bool _bindingSettings;
     private readonly CheckButton _skipExact = new() { Name = "SettingsSkipExact", CustomMinimumSize = new(360, 44), SizeFlagsHorizontal = SizeFlags.ShrinkBegin };
     private readonly SpinBox _queryHistoryLimit = new() { Name = "SettingsQueryHistoryLimit", MinValue = 1, MaxValue = 300, Step = 1, CustomMinimumSize = new(180, 42) };
+    private readonly SpinBox _cpuLoadPercent = new() { Name = "SettingsCpuLoadPercent", MinValue = 1, MaxValue = 100, Step = 1, Suffix = "%", CustomMinimumSize = new(180, 42) };
+    private readonly SpinBox _gpuLoadPercent = new() { Name = "SettingsGpuLoadPercent", MinValue = 0, MaxValue = 100, Step = 1, Suffix = "%", CustomMinimumSize = new(180, 42) };
+    private Button _maximumPerformance = null!;
+    private Label _resourceStatus = null!;
     private bool SettingsSearchBusy => _references?.HasActiveSearch == true || _persistence?.HasSearchInFlight == true;
 
     private void BuildSettings()
@@ -49,7 +54,9 @@ internal sealed partial class WorkspaceShell
             style.ContentMarginLeft = style.ContentMarginRight = 24;
             style.ContentMarginTop = style.ContentMarginBottom = 22;
             panel.AddThemeStyleboxOverride("panel", style); sections.AddChild(panel);
-            var row = new HBoxContainer(); row.AddThemeConstantOverride("separation", 32); panel.AddChild(row);
+            var row = new HFlowContainer();
+            row.AddThemeConstantOverride("h_separation", 32);
+            row.AddThemeConstantOverride("v_separation", 14); panel.AddChild(row);
             var intro = new VBoxContainer { CustomMinimumSize = new(320, 0) }; intro.AddThemeConstantOverride("separation", 10); row.AddChild(intro);
             intro.AddChild(SettingsLabel(titleKey, 23)); intro.AddChild(SettingsLabel(helpKey, 17, true, wrap: true));
             var controls = new VBoxContainer { SizeFlagsHorizontal = SizeFlags.ExpandFill }; controls.AddThemeConstantOverride("separation", 10); row.AddChild(controls);
@@ -71,6 +78,33 @@ internal sealed partial class WorkspaceShell
         };
 
         BuildAppearanceSettings(Section("settings.appearance.title", "settings.appearance.help"));
+
+        var resources = Section("settings.resources.title", "settings.resources.help");
+        var resourceFields = new HFlowContainer();
+        resourceFields.AddThemeConstantOverride("h_separation", 24);
+        resourceFields.AddThemeConstantOverride("v_separation", 12); resources.AddChild(resourceFields);
+        void ResourceField(string label, SpinBox input)
+        {
+            var field = new VBoxContainer(); field.AddThemeConstantOverride("separation", 6);
+            field.AddChild(SettingsLabel(label, 18));
+            input.AddThemeFontSizeOverride("font_size", 18); field.AddChild(input); resourceFields.AddChild(field);
+        }
+        ResourceField("settings.resources.cpu", _cpuLoadPercent);
+        ResourceField("settings.resources.gpu", _gpuLoadPercent);
+        _cpuLoadPercent.ValueChanged += _ => SaveSearchResources();
+        _gpuLoadPercent.ValueChanged += _ => SaveSearchResources();
+        _maximumPerformance = SettingsButton("settings.resources.maximum", () =>
+        {
+            if (SettingsSearchBusy) { RefreshSettings(); return; }
+            _persistence!.SetSearchResources(new(100, 100));
+            _references?.SyncSearchPreferences(); RefreshSettings();
+        }, primary: true);
+        _maximumPerformance.Name = "SettingsMaximumPerformance"; resources.AddChild(_maximumPerformance);
+        resources.AddChild(SettingsLabel("settings.resources.maximum_help", 17, true, wrap: true));
+        _resourceStatus = _palette.Label("", 17, true);
+        _resourceStatus.AutowrapMode = TextServer.AutowrapMode.WordSmart; resources.AddChild(_resourceStatus);
+
+        BuildSearchOptimizationSettings(Section("settings.optimizations.title", "settings.optimizations.help"));
 
         var prediction = Section("settings.run_prediction.title", "settings.run_prediction.help");
         _runPredictionEntry.AddThemeFontSizeOverride("font_size", 20);
@@ -171,6 +205,7 @@ internal sealed partial class WorkspaceShell
         _language.Select(_persistence!.Preferences.LanguageOverride switch { "zh" => 1, "en" => 2, _ => 0 });
         _runPredictionEntry.Text = text.Get("settings.run_prediction.show");
         _skipExact.Text = text.Get("settings.candidates.enable");
+        LocalizeSearchOptimizationSettings(text);
         RefreshSettings();
     }
 
@@ -181,6 +216,15 @@ internal sealed partial class WorkspaceShell
         _skipExact.SetPressedNoSignal(persistence.Preferences.SkipExactValidation);
         _skipExact.Disabled = SettingsSearchBusy;
         _queryHistoryLimit.SetValueNoSignal(persistence.Preferences.QueryHistoryLimit);
+        var resources = persistence.SearchResources;
+        _cpuLoadPercent.SetValueNoSignal(resources.CpuPercent);
+        _gpuLoadPercent.SetValueNoSignal(resources.GpuPercent);
+        _cpuLoadPercent.Editable = _gpuLoadPercent.Editable = !SettingsSearchBusy;
+        _maximumPerformance.Disabled = SettingsSearchBusy;
+        _resourceStatus.Text = SettingsSearchBusy ? text.Get("settings.resources.busy")
+            : text.Format(resources.GpuPercent == 0 ? "settings.resources.cpu_only_status" : "settings.resources.status",
+                resources.ResolveCpuWorkers(System.Environment.ProcessorCount));
+        RefreshSearchOptimizationSettings();
         if (resetInput)
         {
             _bindingSettings = true;
@@ -217,6 +261,15 @@ internal sealed partial class WorkspaceShell
         { _originReceiptKey = "settings.origin.invalid"; RefreshSettings(); return; }
         _originInput.Text = canonical;
         _originReceiptKey = "settings.origin.saved"; RefreshSettings();
+    }
+
+    private void SaveSearchResources()
+    {
+        if (_bindingSettings) return;
+        if (SettingsSearchBusy) { RefreshSettings(); return; }
+        _persistence!.SetSearchResources(new((int)_cpuLoadPercent.Value, (int)_gpuLoadPercent.Value));
+        _references?.SyncSearchPreferences();
+        RefreshSettings();
     }
 
     private void OpenSettingsLogDirectory()

@@ -1,0 +1,11 @@
+RolltheSpire2 1.3.5-resource.17 兼容性说明
+
+已测：Windows x64；游戏0.111.0；MegaDot 4.5.1.m.14 mono；D3D12 12_0 Forward+；i9-14900HX与RTX4090 Laptop。测试配置详见docs/测试配置与方法.md。
+
+Mod沿用游戏已有.NET/Godot，只分发DLL+JSON。未引入CUDA、PyPy、Python或独立本机计算库。CPU四路预筛只在AVX2可用且路线满足时采用，否则标量回退；前缀缓存本身不要求AVX2。
+
+GPU功能依赖宿主可用的本地RenderingDevice与支持的计算后端；不能将OpenGL Compatibility或headless称为GPU计算的通用替代。驱动、游戏版本、其他Mod及未测硬件组合不保证已验证。
+
+功能代码存在不等于所有版本、多人形状或候选表示都已采用该优化。各项具体门槛与回退见docs/现有优化.md。双窗口额外显存约180MiB，仅适用路线尝试，可选第二工作区分配失败时按既有安全回退处理。
+
+本次只整理已发布17的上传资料；暂停中的Windows后台性能保护、后台锁60及未发布实验不在包内。

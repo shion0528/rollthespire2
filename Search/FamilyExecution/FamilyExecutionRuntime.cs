@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using Godot;
 using RolltheSpire2.Bootstrap;
+using RolltheSpire2.Search.Contracts;
+using RolltheSpire2.Search.Runtime;
 
 namespace RolltheSpire2.Search.FamilyExecution;
 
@@ -12,10 +14,22 @@ namespace RolltheSpire2.Search.FamilyExecution;
 public sealed class FamilyExecutionContext : IAsyncDisposable
 {
     private readonly FamilyGpuExecutionOwner? _gpuOwner;
+    private readonly SearchDutyCycleLimiter _gpuBudget;
+    private readonly SearchCpuConcurrencyBudget? _cpuBudget;
+    internal SearchOptimizationSettings Optimizations { get; }
     private readonly FamilyPipelineBoundaryAudit? _pipelineBoundaryAudit = FamilyPipelineBoundaryAudit.TryCreate();
 
-    internal FamilyExecutionContext(bool requiresGpu, bool failOnPhysicalRecovery = false)
+    internal FamilyExecutionContext(bool requiresGpu, bool failOnPhysicalRecovery = false,
+        SearchResourceBudget? resources = null, int cpuWorkers = 64,
+        SearchOptimizationSettings? optimizations = null)
     {
+        Optimizations = optimizations ?? SearchOptimizationScope.Current;
+        using var optimizationScope = SearchOptimizationScope.Enter(Optimizations);
+        if (requiresGpu && resources?.GpuPercent == 0)
+            throw new InvalidOperationException("GpuExecutionDisabledByResourceBudget");
+        _gpuBudget = new(resources?.GpuPercent ?? 100);
+        _cpuBudget = resources is null ? null : new(Math.Min(cpuWorkers,
+            resources.ResolveCpuWorkers(System.Environment.ProcessorCount)));
         _gpuOwner = requiresGpu ? new FamilyGpuExecutionOwner() : null;
         FailOnPhysicalRecovery = failOnPhysicalRecovery;
     }
@@ -25,12 +39,38 @@ public sealed class FamilyExecutionContext : IAsyncDisposable
     internal int GpuOwnerThreadId => _gpuOwner?.OwnerThreadId ?? 0;
     internal bool GpuOwnerStable => _gpuOwner?.IsStable ?? true;
 
+    internal SearchCpuConcurrencyBudget.Scope EnterCpuBudget() =>
+        _cpuBudget?.EnterScope() ?? default;
+
     internal ValueTask<T> ExecuteGpuAsync<T>(
         Func<RenderingDevice, T> action,
-        CancellationToken cancellationToken) =>
-        _gpuOwner is not null
-            ? _gpuOwner.ExecuteAsync(action, cancellationToken)
-            : ValueTask.FromException<T>(new InvalidOperationException("FamilyGpuOwnerUnavailable"));
+        CancellationToken cancellationToken)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(Optimizations);
+        return _gpuOwner is null
+            ? ValueTask.FromException<T>(new InvalidOperationException("FamilyGpuOwnerUnavailable"))
+            : _gpuBudget.IsUnlimited || !cancellationToken.CanBeCanceled
+                ? _gpuOwner.ExecuteAsync(action, cancellationToken)
+                : ExecuteBudgetedGpuAsync(action, cancellationToken);
+    }
+
+    private async ValueTask<T> ExecuteBudgetedGpuAsync<T>(Func<RenderingDevice, T> action,
+        CancellationToken cancellationToken)
+    {
+        await _gpuBudget.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var measured = await _gpuOwner!.ExecuteAsync(rd =>
+        {
+            long before = FamilyGpuComputeUtility.CompletedSubmissionTicks;
+            T result = action(rd);
+            return (Result: result, ActiveTicks: FamilyGpuComputeUtility.CompletedSubmissionTicks - before,
+                Completed: FamilyGpuComputeUtility.LastSubmissionCompleted);
+        }, cancellationToken).ConfigureAwait(false);
+        // Compilation, resource allocation and owner initialization are startup,
+        // not GPU duty. A small budget must not multiply a shader compile into
+        // a minutes-long pause before the first real submission.
+        _gpuBudget.RecordWork(measured.Completed - measured.ActiveTicks, measured.Completed);
+        return measured.Result;
+    }
 
     internal void RecordPipelineBoundarySource(
         SearchBatch batch,
@@ -48,9 +88,17 @@ public sealed class FamilyExecutionContext : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        _pipelineBoundaryAudit?.WriteSummary();
-        if (_gpuOwner is not null)
-            await _gpuOwner.DisposeAsync().ConfigureAwait(false);
+        using var optimizationScope = SearchOptimizationScope.Enter(Optimizations);
+        try { _pipelineBoundaryAudit?.WriteSummary(); }
+        finally
+        {
+            try
+            {
+                if (_gpuOwner is not null)
+                    await _gpuOwner.DisposeAsync().ConfigureAwait(false);
+            }
+            finally { _cpuBudget?.Dispose(); }
+        }
     }
 }
 
@@ -255,6 +303,7 @@ internal sealed class FamilyGpuExecutionOwner : IAsyncDisposable
     private sealed class WorkItem<T> : IWorkItem
     {
         private readonly Func<RenderingDevice, T> _action;
+        private readonly SearchOptimizationSettings _optimizations = SearchOptimizationScope.Current;
         private readonly string _logSession = RuntimeLog.SessionId;
         private readonly CancellationToken _cancellationToken;
         private readonly TaskCompletionSource<T> _completion =
@@ -273,6 +322,7 @@ internal sealed class FamilyGpuExecutionOwner : IAsyncDisposable
 
         public void Execute(RenderingDevice device)
         {
+            using var optimizationScope = SearchOptimizationScope.Enter(_optimizations);
             using var logScope = RuntimeLog.SearchScope(_logSession);
             if (_cancellationToken.IsCancellationRequested)
             {

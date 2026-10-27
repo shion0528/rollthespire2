@@ -15,6 +15,7 @@ internal sealed partial class WorldFamily : IFamilyInvocation
     IEnumerable<GpuLocalPeak> IFamilyInvocation.CostPeaks => _costSamples.Peaks;
     void IFamilyInvocation.LogExecutionEvidence() => _costSamples.WriteSummary();
     private readonly FamilyCpuExecution _cpu;
+    private readonly FamilyHeaderTransportPerformance _headerTransport;
     private readonly ExactSearchExecutionRequest _request;
     private readonly WorldFamilyGpuPlan? _gpuPlan;
 
@@ -51,6 +52,8 @@ internal sealed partial class WorldFamily : IFamilyInvocation
 
     private WorldFamily(ExactSearchExecutionRequest request, WorldFamilyReplay replay)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
+        _headerTransport = new(request.RunOptions.Optimizations);
         _request = request;
         Replay = replay;
         _survival = WorldPhysicalPricing.ResolveSurvival(request);
@@ -69,12 +72,14 @@ internal sealed partial class WorldFamily : IFamilyInvocation
     {
         if (_gpuPlan is null) throw new InvalidOperationException("W.PrivateSerialNotAdmitted");
         var gpu = new WorldFamilyGpuExecutor(rd, _gpuPlan, input?.Buffer, output);
+        _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
         return new(gpu, gpu.Device, gpu.SetupMs, input, output, (batch, count, token) =>
         {
             FamilyCandidateSet? result = null; WorldFamilyGpuMetrics m;
             if (output is not null) gpu.ExecutePrivateStage(batch, count, token, out m);
             else result = input is null ? gpu.Execute(FamilyCandidateSet.Dense(batch), token, out m) : gpu.ExecutePrivate(batch, count, token, out m);
             // W currently reports header timing separately, not full payload time.
+            _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
             return new(m.Output, result, m.DispatchSyncMs, m.HeaderReadbackMs,
                 m.HeaderReadBytes + m.PayloadReadBytes, m.CanonicalMs, m.Dispatches);
         });
@@ -83,14 +88,21 @@ internal sealed partial class WorldFamily : IFamilyInvocation
     // No accepted World joint cost model: null is unavailable, never a zero-cost quote.
     public FamilyExpectedFilteringCostProjection? ExpectedFilteringCost => null;
     public FamilySurvivalProjection Survival => _survival;
-    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest geometry) =>
-        _request.ProfileId == Compatibility.RuntimeProfileId.Beta111 && _request.Authority.CanUseCurrentModel &&
-        _request.Authority.PlayersCount == 1 && _request.Authority.AllCharacterCardPoolsUnlocked == true
-            ? WorldPhysicalPricing.Quote(Replay, _gpuPlan, geometry) : null;
+    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest geometry)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return _request.ProfileId == Compatibility.RuntimeProfileId.Beta111 && _request.Authority.CanUseCurrentModel &&
+            _request.Authority.PlayersCount == 1 && _request.Authority.AllCharacterCardPoolsUnlocked == true
+                ? WorldPhysicalPricing.Quote(Replay, _gpuPlan, geometry) : null;
+    }
     public FamilyConditionPerformanceProjection ConditionPerformance => ResolveConditionPerformance(false);
-    public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compactAbi1Input) => _gpuPlan is null
-        ? _cpu.Condition(compactAbi1Input) : new(FamilyId,_gpuPlan.Revision(compactAbi1Input),
-            "W.Neutral.20260907.v1",1,"NoAcceptedWithinPathCurve;CanonicalAbi1Ready",usesGpu:true);
+    public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compactAbi1Input)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return _gpuPlan is null ? _cpu.Condition(compactAbi1Input) : _headerTransport.Apply(
+            new(FamilyId,_gpuPlan.Revision(compactAbi1Input), "W.Neutral.20260907.v1",1,
+                "NoAcceptedWithinPathCurve;CanonicalAbi1Ready",usesGpu:true),_gpu?.HeaderReadbackRevision);
+    }
     public FamilyPerformanceObservation CapturePerformanceObservation()
     {
         if (_gpuPlan is null) return _cpu.Observation();
@@ -106,7 +118,7 @@ internal sealed partial class WorldFamily : IFamilyInvocation
         if (_gpuPlan is null) return _cpu.Live();
         var o = Observation;
         return _faulted || !_parity || o.Batches < 2 ? null :
-            new(FamilyId, _gpuPlan.Revision(_compact), Interlocked.Read(ref o.LiveInputs), Volatile.Read(ref o.LiveMs), o.Batches - 1);
+            new(FamilyId, ResolveConditionPerformance(_compact).PhysicalImplementationRevision, Interlocked.Read(ref o.LiveInputs), Volatile.Read(ref o.LiveMs), o.Batches - 1);
     }
     public async ValueTask<FamilyCandidateSet> InvokeAsync(FamilyExecutionContext executionContext,
         FamilyObservationWindow observationWindow, FamilyCandidateSet input, CancellationToken cancellationToken)

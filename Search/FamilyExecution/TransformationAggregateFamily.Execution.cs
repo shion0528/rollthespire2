@@ -14,6 +14,7 @@ internal sealed class TransformationAggregateFamily : IFamilyInvocation
     internal TransformationAggregateProbability Probability { get; }
     private readonly double? _givenNeow;
     private readonly FamilyCpuExecution _cpu;
+    private readonly FamilyHeaderTransportPerformance _headerTransport;
     private TransformationAggregateGpuExecutor? _gpu;
     private bool _parity,_faulted,_compact;
     private readonly GpuCostSamples _costSamples=new();
@@ -21,6 +22,8 @@ internal sealed class TransformationAggregateFamily : IFamilyInvocation
     private double _canonical,_liveMs,_peak,_validPeak,_dispatch,_readback;
     internal TransformationAggregateFamily(ExactSearchExecutionRequest request)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
+        _headerTransport = new(request.RunOptions.Optimizations);
         _request=request;Plan=new(request);GpuPlan=new(Plan);Probability=TransformationAggregateProbability.Build(Plan);
         if (Plan.Neow is not null && HasConditionalProjections)
             _givenNeow = TransformationAggregateProbability.Conditional(
@@ -38,13 +41,20 @@ internal sealed class TransformationAggregateFamily : IFamilyInvocation
             : _givenNeow is { } joint ? FamilySurvivalProjection.Resolved(Id, joint, "T.GivenN;ExistingSameDrawJointOverNMarginal")
             : FamilySurvivalProjection.Unresolved(Id, "T+N.AdditionalPredicateJointUnknown");
     public FamilyAnalyticalCostProjection AnalyticalCost=>new(Id,GpuPlan.Capacity,[],"T.OwnedNumericalWork");
-    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest g)=>GpuPlan.Supported
-        ? TransformationAggregatePricing.Gpu(Plan,Probability,GpuPlan,g):TransformationAggregatePricing.Cpu(Plan,Probability,g);
+    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest g)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return GpuPlan.Supported ? TransformationAggregatePricing.Gpu(Plan,Probability,GpuPlan,g):TransformationAggregatePricing.Cpu(Plan,Probability,g);
+    }
     public FamilyConditionPerformanceProjection ConditionPerformance=>ResolveConditionPerformance(false);
-    public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compact)=>!GpuPlan.Supported?_cpu.Condition(compact):
-        new(Id,(GpuPlan.BonesOptimized ? "T.Gpu.BonesTracked."+(GpuPlan.FullTarget?"TransformFirst.Carry8.AllRequired":"OpeningFirst.Generic")+".20261001.v1" :
-            GpuPlan.FullTarget?TransformationAggregateGpuPlan.FullTargetRevision:TransformationAggregateGpuPlan.GenericRevision)+"."+(compact?"CompactAbi1":"Dense")+".CanonicalAbi1Ready",
-            "T.Gpu.Neutral.20260914.v1",1,"FamilyOwned;LocalAggregate;NoLeafPredicate",usesGpu:true);
+    public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compact)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return !GpuPlan.Supported?_cpu.Condition(compact):_headerTransport.Apply(
+            new(Id,(GpuPlan.BonesOptimized ? "T.Gpu.BonesTracked."+(GpuPlan.FullTarget?"TransformFirst.Carry8.AllRequired":"OpeningFirst.Generic")+".20261001.v1" :
+                GpuPlan.FullTarget?TransformationAggregateGpuPlan.FullTargetRevision:TransformationAggregateGpuPlan.GenericRevision)+"."+(compact?"CompactAbi1":"Dense")+".CanonicalAbi1Ready"+SharedVisibleSeedGpuCache.RevisionSuffix,
+                "T.Gpu.Neutral.20260914.v1",1,"FamilyOwned;LocalAggregate;NoLeafPredicate",usesGpu:true),_gpu?.HeaderReadbackRevision);
+    }
     IEnumerable<IFamilyInvocation> IFamilyInvocation.CpuRealizations=>[_cpu];
     IEnumerable<GpuLocalPeak> IFamilyInvocation.CostPeaks=>_costSamples.Peaks;
     bool IFamilyInvocation.CanBindPrivateSerial=>GpuPlan.Supported;
@@ -52,11 +62,13 @@ internal sealed class TransformationAggregateFamily : IFamilyInvocation
     {
         if(!GpuPlan.Supported)throw new InvalidOperationException("T.PrivateNotAdmitted");
         var gpu=new TransformationAggregateGpuExecutor(rd,GpuPlan,input,output);
+        _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
         return new(gpu,gpu.Device,gpu.SetupMs,input,output,(batch,count,token)=>
         {
             FamilyCandidateSet? result=null;TransformationAggregateGpuMetrics m;
             if(output is not null)gpu.ExecutePrivateStage(batch,count,token,out m);
             else result=input is null?gpu.Execute(FamilyCandidateSet.Dense(batch),token,out m):gpu.ExecutePrivate(batch,count,token,out m);
+            _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
             return new(m.Output,result,m.DispatchSyncMs,m.ReadbackMs,m.ReadbackBytes,m.CanonicalMs,m.Dispatches);
         });
     }

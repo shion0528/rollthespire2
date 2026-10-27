@@ -10,6 +10,7 @@ internal sealed partial class EventResultFamily : IFamilyInvocation
     void IFamilyInvocation.LogExecutionEvidence() => _costSamples.WriteSummary();
     private readonly ExactSearchExecutionRequest _request;
     private readonly FamilyCpuExecution _cpu;
+    private readonly FamilyHeaderTransportPerformance _headerTransport;
     internal EventResultFamilyPlan Plan { get; }
     private EventResultFamilyGpuExecutor? _gpu;
     private bool _parity, _faulted, _compact;
@@ -21,6 +22,8 @@ internal sealed partial class EventResultFamily : IFamilyInvocation
     }
     private EventResultFamily(ExactSearchExecutionRequest request)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
+        _headerTransport = new(request.RunOptions.Optimizations);
         _request = request; Plan = new(request); _cpu = new(request, FamilyId, CpuRevision);
         RuntimeLog.TryBackgroundInfo($"eventResultFamilyReady=true;family={FamilyId};physicalRevision={ConditionPerformance.PhysicalImplementationRevision};gpu={Plan.GpuSupported};recovery=None");
     }
@@ -32,23 +35,33 @@ internal sealed partial class EventResultFamily : IFamilyInvocation
     {
         if (!Plan.GpuSupported) throw new InvalidOperationException("E.PrivateSerialNotAdmitted");
         var gpu = new EventResultFamilyGpuExecutor(rd, Plan, input, output);
+        _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
         return new(gpu, gpu.Device, gpu.SetupMs, input, output, (batch, count, token) =>
         {
             FamilyCandidateSet? result = null; EventResultFamilyGpuMetrics m;
             if (output is not null) gpu.ExecutePrivateStage(batch, count, token, out m);
             else result = input is null ? gpu.Execute(FamilyCandidateSet.Dense(batch), token, out m) : gpu.ExecutePrivate(batch, count, token, out m);
+            _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
             return new(m.Output, result, m.DispatchSyncMs, m.ReadbackMs, m.ReadbackBytes, m.CanonicalMs, m.Dispatches);
         });
     }
-    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest geometry) =>
-        EventResultPhysicalPricing.Quote(Plan, geometry);
+    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest geometry)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return EventResultPhysicalPricing.Quote(Plan, geometry);
+    }
     public FamilySurvivalProjection Survival => Plan.Survival;
     public FamilyExpectedFilteringCostProjection? ExpectedFilteringCost => null;
     public FamilyAnalyticalCostProjection AnalyticalCost => new(FamilyId, Plan.Capacity, [], "EventLocalExpectedWorkUnavailable");
     public FamilyConditionPerformanceProjection ConditionPerformance => ResolveConditionPerformance(false);
-    public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compact) => !Plan.GpuSupported ? _cpu.Condition(compact) :
-        new(FamilyId, $"E.EventResult.Gpu.Whitelist.{(compact ? "CompactAbi1" : "Dense")}.CanonicalAbi1Ready.20260919.v1",
-            "E.EventResult.Neutral.20260907.v1", 1, "NoAcceptedWithinPathCurve;CanonicalAbi1Ready", usesGpu: true);
+    public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compact)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return !Plan.GpuSupported ? _cpu.Condition(compact) : _headerTransport.Apply(
+            new(FamilyId, $"E.EventResult.Gpu.Whitelist.{(compact ? "CompactAbi1" : "Dense")}.CanonicalAbi1Ready.20260919.v1" + SharedVisibleSeedGpuCache.RevisionSuffix,
+                "E.EventResult.Neutral.20260907.v1", 1, "NoAcceptedWithinPathCurve;CanonicalAbi1Ready", usesGpu: true),
+            _gpu?.HeaderReadbackRevision);
+    }
     public FamilyPerformanceObservation CapturePerformanceObservation()
     {
         if (!Plan.GpuSupported) return _cpu.Observation(); var s = Current;

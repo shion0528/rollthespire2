@@ -37,9 +37,13 @@ internal sealed partial class QueryWorkbenchFrame
             seconds<86400 ? _text.Format("workflow.hours",(seconds/3600).ToString("0.#",CultureInfo.InvariantCulture)) :
             _text.Format("workflow.days",CompactNumber(seconds/86400));
     }
-    private int SearchWorkers => SearchWorkspacePersistence.ResolveSearchWorkers(
-        _persistence.Preferences.SearchWorkerBudget, System.Environment.ProcessorCount);
+    private SearchResourceBudget SearchResources => _persistence.SearchResources;
+    private SearchOptimizationSettings SearchOptimizations => _persistence.SearchOptimizations;
+    private int SearchWorkers => SearchResources.ResolveCpuWorkers(System.Environment.ProcessorCount);
+    private bool SearchCpuOnly => _persistence.Preferences.SearchMode == "CPU" || SearchResources.GpuPercent == 0;
     private string AnalysisKey(string query) => query+_language+":"+_target+":"+_persistence.Preferences.SearchMode+":"+SearchWorkers+
+        ":cpuBudget="+SearchResources.CpuPercent+":gpuBudget="+SearchResources.GpuPercent+
+        ":optimizations="+SearchOptimizations.Key+
         ":gpu="+FamilyDeviceProfileFoundation.Initialization.Capture().Revision;
     private string _draftCompileIssue="";
     private bool UpdateProbabilityPanel(WorkbenchSearchDraft draft,string serialized)
@@ -56,6 +60,7 @@ internal sealed partial class QueryWorkbenchFrame
             _draftCompileIssue=ex.Message.StartsWith(RolltheSpire2.Compatibility.ProfileSeedGenerator.UnavailableCode, StringComparison.Ordinal)
                 ? SeedProfileUnavailableMessage()
                 : _text.Get(TransformationContinuationIssueKey(ex.Message) ?? "integration.rejected");
+            SetCheckpointFingerprint("");
             _previewEta=null;_familyEntries.Clear();
             var q=draft.Query;
             void Pending(string id,bool present) {if(present)_familyEntries.Add(new(id,FamilyTitle(id),null,"—",""));}
@@ -68,13 +73,14 @@ internal sealed partial class QueryWorkbenchFrame
             RenderFamilyDashboard();PresentExpectations(null,null,null);
             return false;
         }
+        SetCheckpointFingerprint(compiled.SemanticFingerprint);
         _previewEta = null;
         _probabilityPending = true;
         _familyEntries.Clear(); RenderFamilyDashboard();
         _expectationContext = _language == "zh" ? "正在计算当前条件…" : "Calculating current conditions…";
         PresentExpectations(null, null, null);
         if (_expectationValues[0] is { } rarity) rarity.Text = rarity.TooltipText = _language == "zh" ? "计算中…" : "Calculating…";
-        _probabilityPreview.Submit(new(_analysisKey, compiled, _target, SearchWorkers, _persistence.Preferences.SearchMode == "CPU"));
+        _probabilityPreview.Submit(new(_analysisKey, compiled, _target, SearchWorkers, SearchCpuOnly, SearchResources, SearchOptimizations));
         // Estimate failures do not change admission; canonical compile failures do.
         return true;
     }
@@ -109,7 +115,7 @@ internal sealed partial class QueryWorkbenchFrame
     }
 
     internal string DescribeProbability(CompiledSearch compiled) => DescribeProbability(compiled,
-        WorkbenchProbabilityPreview.Compute(compiled, _target, SearchWorkers, _persistence.Preferences.SearchMode == "CPU"));
+        WorkbenchProbabilityPreview.Compute(compiled, _target, SearchWorkers, SearchCpuOnly, SearchResources, SearchOptimizations));
 
     internal string DescribeProbability(CompiledSearch compiled, WorkbenchProbabilityPreview preview)
     {

@@ -1,0 +1,17 @@
+config_version=5
+
+[application]
+config/name="RolltheSpire2 GPU resource smoke"
+run/main_scene="res://Smoke.tscn"
+
+[display]
+window/size/viewport_width=64
+window/size/viewport_height=64
+window/size/mode=1
+
+[dotnet]
+project/assembly_name="ProductionSearchHost"
+
+[rendering]
+renderer/rendering_method="mobile"
+renderer/rendering_method.mobile="mobile"

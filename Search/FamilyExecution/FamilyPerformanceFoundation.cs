@@ -12,19 +12,19 @@ public static class FamilyPhysicalImplementationRevisions
     // executors. Planner performance identities below additionally name the actual
     // input path and the canonical ABI1-ready timing boundary.
     public const string MerchantShopColorlessAtomicAppendHostSort =
-        "S.MerchantShopColorless.Gpu.v7.Base34Carry8.ProcessedWorkgroup.ConsumeOnly.HistoricalNextInt";
+        "S.MerchantShopColorless.Gpu.v9.Base34Carry8.ProcessedWorkgroup.ConsumeOnly.HistoricalNextInt.TailAfterPredicates";
     public const string MerchantShopColorlessStableOrderedCompaction =
-        "S.MerchantShopColorless.Gpu.v8.StableOrderedCompaction.HostPrefixScatter.Base34Carry8.ProcessedWorkgroup.ConsumeOnly.HistoricalNextInt";
+        "S.MerchantShopColorless.Gpu.v10.StableOrderedCompaction.HostPrefixScatter.Base34Carry8.ProcessedWorkgroup.ConsumeOnly.HistoricalNextInt.TailAfterPredicates";
     public const string MerchantShopColorless = MerchantShopColorlessAtomicAppendHostSort;
     public const string Relic = "R.Relic.Gpu.v7.TrackedPositions.Base34Carry8.ProcessedWorkgroup.CompactFullDecode.HistoricalNextInt";
     public const string RelicFull = RelicFullGpuPlan.AlgorithmRevision;
 
     public const string MerchantShopColorlessAtomicDensePerformance =
-        "S.MerchantShopColorless.Atomic.DenseCarry8.CanonicalAbi1Ready.20260904.v1";
+        "S.MerchantShopColorless.Atomic.DenseCarry8.CanonicalAbi1Ready.TailAfterPredicates.20261022.v2";
     public const string MerchantShopColorlessStableDensePerformance =
-        "S.MerchantShopColorless.Stable.DenseCarry8.CanonicalAbi1Ready.20260904.v1";
+        "S.MerchantShopColorless.Stable.DenseCarry8.CanonicalAbi1Ready.TailAfterPredicates.20261022.v2";
     public const string MerchantShopColorlessCompactPerformance =
-        "S.MerchantShopColorless.Atomic.CompactAbi1FullDecode.CanonicalAbi1Ready.20260904.v1";
+        "S.MerchantShopColorless.Atomic.CompactAbi1FullDecode.CanonicalAbi1Ready.TailAfterPredicates.20261022.v2";
     public const string RelicDensePerformance =
         "R.Relic.DenseCarry8.CanonicalAbi1Ready.20260904.v1";
     public const string RelicCompactPerformance =

@@ -44,6 +44,7 @@ internal sealed partial class NeowFamily
         private bool UsesPrivate => _optimize && _gpuStages.Count > 1 && _gpuStages.All(s => s.Family.CanBindPrivateSerial);
         internal PartyInitial(ExactSearchExecutionRequest request, bool preferGpu = false, bool optimize = true, bool? fuse = null)
         {
+            using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
             _optimize = optimize; _fuse = fuse;
             _request = request;
             _cpu = new(request, FamilyId, "N.Neow.PartyEffects.Cpu.v2", workers: Math.Clamp(request.WorkerCount, 1, 32), numericalRoots: true);
@@ -289,6 +290,7 @@ internal sealed partial class NeowFamily
         public FamilyAnalyticalCostProjection AnalyticalCost => new(FamilyId, FamilyCpuExecution.Capacity, [], "PartyInitialAnalyticalWorkUnavailable;PhysicalQuoteBounded");
         public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest geometry)
         {
+            using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
             if (!FamilyPhysicalQuote.AdmittedRequest(geometry) || geometry.PrivateInput || geometry.PrivateOutput ||
                 geometry.MeanInputPopulation <= 0) return null;
             int window = ConditionPerformance.UsesGpu ? FamilyPhysicalExecutionDefaults.DefaultCandidateBatchSize : FamilyCpuExecution.Capacity;
@@ -318,6 +320,7 @@ internal sealed partial class NeowFamily
         internal AutomaticPrivateSerialPricing.PricedOrder? Price(double roots, bool compact,
             GpuCostSnapshot gpuCosts, int rootWindow)
         {
+            using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
             double outputRate = Survival.SurvivalProbability ?? 1;
             if (_gpuStages.Count == 0)
             {
@@ -355,10 +358,15 @@ internal sealed partial class NeowFamily
                 Quote, (_, _) => 1, firstCompactInput: compact,
                 rootWindowOverride: rootWindow, initialSetupMs: 0);
         }
-        public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compact) => _gpuStages.Count == 0 ? _cpu.Condition(compact) :
-            new(FamilyId, "N.Neow.PartyEffects.Gpu.v6." + (UsesFused ? "Fused." : UsesPrivate ? "PrivateOrdinal." : "Public.") + (compact ? "CompactAbi1" : "Dense"),
-                "OrderedSlotInitialOffers", 1, "InitialOffersAndResolvedEffects;SharedArrival=AuthoredDrawUnion;Remainder=WholeTableExact;BoundedLocalPhysicalQuote",
-                usesGpu: _gpuStages.Any(s => s.Family.ConditionPerformance.UsesGpu));
+        public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compact)
+        {
+            using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+            return _gpuStages.Count == 0 ? _cpu.Condition(compact) :
+                new(FamilyId, "N.Neow.PartyEffects.Gpu.v6." + (UsesFused ? "Fused." : UsesPrivate ? "PrivateOrdinal." : "Public.") + (compact ? "CompactAbi1" : "Dense") +
+                    (UsesFused && _fused?.SharedPrefixHashRevisionFor(compact) is { } sharedPrefix ? "." + sharedPrefix : ""),
+                    "OrderedSlotInitialOffers", 1, "InitialOffersAndResolvedEffects;SharedArrival=AuthoredDrawUnion;Remainder=WholeTableExact;BoundedLocalPhysicalQuote",
+                    usesGpu: _gpuStages.Any(s => s.Family.ConditionPerformance.UsesGpu));
+        }
         IEnumerable<IFamilyInvocation> IFamilyInvocation.CpuRealizations => [new PartyInitial(_request)];
         public async ValueTask<FamilyCandidateSet> InvokeAsync(FamilyExecutionContext context, FamilyObservationWindow window,
             FamilyCandidateSet input, CancellationToken token)

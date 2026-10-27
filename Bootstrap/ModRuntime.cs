@@ -58,6 +58,7 @@ internal static class ModRuntime
             }
             RuntimeLog.Info($"Readable log: {RuntimeLog.CurrentLogPath}");
             RuntimeLog.Info($"rt2BuildIdentity={typeof(ModRuntime).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false).OfType<System.Reflection.AssemblyInformationalVersionAttribute>().FirstOrDefault()?.InformationalVersion}");
+            ResourceTransportProbe.RunIfRequested();
             RuntimeLog.GlobalSummary("RT2 loaded", startup: true);
             RuntimeLog.Info($"versionEvidence={detection.Evidence}");
             if (!detection.IsExact) RuntimeLog.Warn($"versionDetectionFailed={detection.FailureReason}");

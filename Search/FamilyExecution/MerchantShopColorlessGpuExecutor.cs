@@ -73,6 +73,8 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
     private const string StableScatterShaderSuffix = "MerchantShopColorlessStableScatter.comp.glsl";
 
     private readonly RenderingDevice _rd;
+    private readonly FamilyGpuHeaderReadback _headerReadback;
+    internal string HeaderReadbackRevision => _headerReadback.Revision;
     private readonly List<Rid> _owned = new();
     private readonly Rid _pipeline;
     private readonly Rid _batchMeta;
@@ -89,9 +91,11 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
     private readonly Rid _stableBlockCounts;
     private readonly Rid _stableBlockOffsets;
     private readonly uint _planTag;
+    private readonly MerchantOrderedSequenceSlotsPlan _orderedSequenceSlots;
     private readonly int _ownerThreadId;
     private bool _disposed;
     private PrivateOrdinalBuffer? _privateInput, _privateOutput;
+    private SharedVisibleSeedGpuCache? _prefixCache;
     private int OutputCapacity => _privateInput is not null || _privateOutput is not null ? Capacity : SurvivorCapacity;
 
     private MerchantShopColorlessGpuExecutor(
@@ -113,9 +117,11 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
         uint planTag,
         int ownerThreadId,
         double setupMs,
-        string deviceName)
+        string deviceName,
+        MerchantOrderedSequenceSlotsPlan orderedSequenceSlots)
     {
         _rd = rd;
+        _headerReadback = new(rd, FamilyGpuHeaderReadback.Requested);
         _pipeline = pipeline;
         _batchMeta = batchMeta;
         _inputOrdinals = inputOrdinals;
@@ -134,22 +140,29 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
         _ownerThreadId = ownerThreadId;
         SetupMs = setupMs;
         DeviceName = deviceName;
+        _orderedSequenceSlots = orderedSequenceSlots;
     }
 
     public double SetupMs { get; }
     public string DeviceName { get; }
     public bool StableOrderedCompactionEnabled => _stableEnabled;
-    public string PhysicalImplementationRevision => _stableEnabled
+    internal bool OrderedSequenceSlotsEnabled => _orderedSequenceSlots.Applied;
+    internal MerchantOrderedSequenceSlotsPlan OrderedSequenceSlotsPlan => _orderedSequenceSlots;
+    public string PhysicalImplementationRevision => (_stableEnabled
         ? FamilyPhysicalImplementationRevisions.MerchantShopColorlessStableOrderedCompaction
-        : FamilyPhysicalImplementationRevisions.MerchantShopColorlessAtomicAppendHostSort;
+        : FamilyPhysicalImplementationRevisions.MerchantShopColorlessAtomicAppendHostSort) +
+        (_prefixCache is null ? "" : "." + SharedVisibleSeedGpuCache.Revision) +
+        _orderedSequenceSlots.RevisionSuffix + "." + _headerReadback.Revision;
 
     public static MerchantShopColorlessGpuExecutor Create(RenderingDevice rd, ExactSearchExecutionRequest request,
-        MerchantShopColorlessCompactionPath compactionPath) => Create(rd, request, compactionPath, null, null);
+        MerchantShopColorlessCompactionPath compactionPath,
+        bool? useOrderedSequenceSlots = null) => Create(rd, request, compactionPath, null, null, useOrderedSequenceSlots);
     internal static MerchantShopColorlessGpuExecutor Create(
         RenderingDevice rd,
         ExactSearchExecutionRequest request,
         MerchantShopColorlessCompactionPath compactionPath,
-        PrivateOrdinalBuffer? privateInput, PrivateOrdinalBuffer? privateOutput)
+        PrivateOrdinalBuffer? privateInput, PrivateOrdinalBuffer? privateOutput,
+        bool? useOrderedSequenceSlots = null)
     {
         if (privateInput is not null && ReferenceEquals(privateInput, privateOutput)) throw new ArgumentException("S.PrivateBuffersAlias");
         if ((privateInput is not null || privateOutput is not null) && compactionPath == MerchantShopColorlessCompactionPath.StableOrderedCompaction)
@@ -163,11 +176,13 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
             Rid Add(Rid rid) { owned.Add(rid); return rid; }
             bool stableEnabled = compactionPath == MerchantShopColorlessCompactionPath.StableOrderedCompaction;
             Beta111MerchantColorlessAuthority authority = Beta111MerchantColorlessAuthority.From(request.Authority);
-            uint[] plan = PackPlan(request.Evaluation, authority, out uint[] targets);
+            var orderedSequenceSlots = MerchantShopColorlessOrderedSequencePolicy.Compile(request, useOrderedSequenceSlots);
+            uint[] plan = PackPlan(orderedSequenceSlots.Evaluation, authority, out uint[] targets);
             uint planTag = StableTag(
                 request.SnapshotFingerprint + "|" + (stableEnabled
                     ? FamilyPhysicalImplementationRevisions.MerchantShopColorlessStableOrderedCompaction
-                    : FamilyPhysicalImplementationRevisions.MerchantShopColorlessAtomicAppendHostSort));
+                    : FamilyPhysicalImplementationRevisions.MerchantShopColorlessAtomicAppendHostSort) +
+                orderedSequenceSlots.RevisionSuffix);
 
             Rid batchMeta = Add(FamilyGpuComputeUtility.CreateZeroedStorageBuffer(rd, 6 * sizeof(uint)));
             Rid inputOrdinals = privateInput?.Buffer ?? Add(FamilyGpuComputeUtility.CreateZeroedStorageBuffer(
@@ -196,14 +211,13 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
                 if (!source.Contains(low, StringComparison.Ordinal) || !source.Contains(high, StringComparison.Ordinal)) throw new InvalidOperationException("S.PrivateOutputSeamChanged");
                 source = source.Replace(low, "compact_output.values[slot] = uint(logical_ordinal);", StringComparison.Ordinal).Replace(high, "", StringComparison.Ordinal);
             }
+            Rid[] buffers = [batchMeta, inputOrdinals, planBuffer, targetBuffer, outputHeader, outputOrdinals];
+            var prefixCache = SharedVisibleSeedGpuCache.Attach(rd, owned, ref source, ref buffers, "S.MerchantShopColorless");
             Rid shader = Add(FamilyGpuComputeUtility.CompileShader(rd, source, "MerchantShopColorlessFamilyS"));
             Rid pipeline = Add(FamilyGpuComputeUtility.CreateComputePipeline(rd, shader, "S.MerchantShopColorless"));
             if (!rd.ComputePipelineIsValid(pipeline))
                 throw new InvalidOperationException("SFamilyGpuPipelineInvalid");
-            Rid uniformSet = Add(FamilyGpuComputeUtility.CreateUniformSet(rd, shader, new[]
-            {
-                batchMeta, inputOrdinals, planBuffer, targetBuffer, outputHeader, outputOrdinals
-            }));
+            Rid uniformSet = Add(FamilyGpuComputeUtility.CreateUniformSet(rd, shader, buffers));
 
             Rid stablePhase1Pipeline = default;
             Rid stablePhase1UniformSet = default;
@@ -219,16 +233,29 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
                 stableBlockOffsets = Add(FamilyGpuComputeUtility.CreateZeroedStorageBuffer(rd, StableBlockOffsetBytes));
 
                 string stablePhase1Source = EnableStableOrderedCompaction(source);
+                if (prefixCache is not null)
+                {
+                    // Stable phase 1 already owns bindings 6/7. Only relocate
+                    // the cache declaration; all phases borrow one owned table.
+                    const string prefixBinding = "layout(set=0,binding=6,std430) readonly restrict buffer Rt2VisiblePrefix";
+                    int bindingAt = stablePhase1Source.IndexOf(prefixBinding, StringComparison.Ordinal);
+                    if (bindingAt < 0 || bindingAt != stablePhase1Source.LastIndexOf(prefixBinding, StringComparison.Ordinal))
+                        throw new InvalidOperationException("S.SharedPrefixStableBindingSeamChanged");
+                    stablePhase1Source = stablePhase1Source.Replace(prefixBinding,
+                        "layout(set=0,binding=8,std430) readonly restrict buffer Rt2VisiblePrefix", StringComparison.Ordinal);
+                }
                 Rid stablePhase1Shader = Add(FamilyGpuComputeUtility.CompileShader(
                     rd, stablePhase1Source, "MerchantShopColorlessFamilySStablePhase1"));
                 stablePhase1Pipeline = Add(FamilyGpuComputeUtility.CreateComputePipeline(rd, stablePhase1Shader, "S.StablePhase1"));
                 if (!rd.ComputePipelineIsValid(stablePhase1Pipeline))
                     throw new InvalidOperationException("SFamilyStablePhase1PipelineInvalid");
-                stablePhase1UniformSet = Add(FamilyGpuComputeUtility.CreateUniformSet(rd, stablePhase1Shader, new[]
+                Rid[] stableBuffers =
                 {
                     batchMeta, inputOrdinals, planBuffer, targetBuffer, outputHeader, outputOrdinals,
                     stableKeepMasks, stableBlockCounts
-                }));
+                };
+                if (prefixCache is not null) stableBuffers = [.. stableBuffers, prefixCache.Buffer];
+                stablePhase1UniformSet = Add(FamilyGpuComputeUtility.CreateUniformSet(rd, stablePhase1Shader, stableBuffers));
 
                 string scatterSource = FamilyGpuComputeUtility.LoadEmbeddedShader(StableScatterShaderSuffix);
                 Rid scatterShader = Add(FamilyGpuComputeUtility.CompileShader(
@@ -248,10 +275,16 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
                 uniformSet, stableEnabled, stablePhase1Pipeline, stablePhase1UniformSet,
                 stableScatterPipeline, stableScatterUniformSet, stableKeepMasks, stableBlockCounts,
                 stableBlockOffsets, planTag, Thread.CurrentThread.ManagedThreadId,
-                timer.Elapsed.TotalMilliseconds, rd.GetDeviceName()?.Trim() ?? "unknown");
+                timer.Elapsed.TotalMilliseconds, rd.GetDeviceName()?.Trim() ?? "unknown", orderedSequenceSlots);
             result._privateInput = privateInput; result._privateOutput = privateOutput;
+            result._prefixCache = prefixCache;
             result._owned.AddRange(owned);
             owned.Clear();
+            Bootstrap.RuntimeLog.TryBackgroundInfo($"sOrderedSequenceSlots=true;requested={orderedSequenceSlots.Requested};" +
+                $"enabled={orderedSequenceSlots.Applied};revision={orderedSequenceSlots.RevisionSuffix};" +
+                $"expandedSequences={orderedSequenceSlots.ExpandedSequences};addedSlots={orderedSequenceSlots.AddedSlots};" +
+                $"originalMaximumOrdinal={orderedSequenceSlots.OriginalMaximumOrdinal};packedMaximumOrdinal={orderedSequenceSlots.PackedMaximumOrdinal};" +
+                $"reason={orderedSequenceSlots.Reason};shaderPredicateAndRngBodyUnchanged=true;physicalRevision={result.PhysicalImplementationRevision}");
             return result;
         }
         catch (Exception ex)
@@ -265,25 +298,53 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
     public FamilyCandidateSet Execute(FamilyCandidateSet input, CancellationToken token, out MerchantShopColorlessGpuBatchMetrics metrics)
     {
         if (_privateInput is not null || _privateOutput is not null) throw new InvalidOperationException("S.PrivateEntryRequired");
+        double prefixUploadMs = RefreshPrefixCache(input.Batch, input.Count, token);
         // Public output has the same bounded capacity as compact upload. Dense
         // inputs also need windows: legal small/modded pools can pass every root.
-        if (input.Count > SurvivorCapacity && input.Count <= Capacity)
-            return ExecutePublicWindows(input, token, out metrics);
-        return ExecuteCore(input, input.Count, token, out metrics)!;
+        FamilyCandidateSet result = input.Count > SurvivorCapacity && input.Count <= Capacity
+            ? ExecutePublicWindows(input, token, out metrics)
+            : ExecuteCore(input, input.Count, token, out metrics)!;
+        metrics = IncludePrefixUpload(metrics, prefixUploadMs);
+        return result;
     }
     internal FamilyCandidateSet ExecutePrivate(SearchBatch batch, int count, CancellationToken token, out MerchantShopColorlessGpuBatchMetrics metrics)
     {
         if (_privateInput is null || _privateOutput is not null) throw new InvalidOperationException("S.PrivateTerminalPortsRequired");
         _privateInput.CheckPopulation(batch, count);
-        return ExecuteCore(FamilyCandidateSet.Dense(batch), count, token, out metrics)!;
+        double prefixUploadMs = RefreshPrefixCache(batch, count, token);
+        FamilyCandidateSet result = ExecuteCore(FamilyCandidateSet.Dense(batch), count, token, out metrics)!;
+        metrics = IncludePrefixUpload(metrics, prefixUploadMs);
+        return result;
     }
     internal int ExecutePrivateStage(SearchBatch batch, int count, CancellationToken token, out MerchantShopColorlessGpuBatchMetrics metrics)
     {
         if (_privateOutput is null || (_privateInput is null && count != batch.BatchCandidateCount)) throw new InvalidOperationException("S.PrivateStagePortsRequired");
         _privateOutput.CheckPopulation(batch, count); _privateInput?.CheckPopulation(batch, count);
+        double prefixUploadMs = RefreshPrefixCache(batch, count, token);
         ExecuteCore(FamilyCandidateSet.Dense(batch), count, token, out metrics);
+        metrics = IncludePrefixUpload(metrics, prefixUploadMs);
         return metrics.Survivors;
     }
+
+    private double RefreshPrefixCache(SearchBatch batch, int count, CancellationToken token)
+    {
+        AssertOwnerThread();
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        token.ThrowIfCancellationRequested();
+        if (_prefixCache is null || count == 0) return 0d;
+        // Dense public windows rebase their metadata, while this pure hash table
+        // continues to cover the original batch's absolute ordinal range.
+        var timer = Stopwatch.StartNew();
+        _prefixCache.Refresh(batch);
+        return timer.Elapsed.TotalMilliseconds;
+    }
+
+    private static MerchantShopColorlessGpuBatchMetrics IncludePrefixUpload(MerchantShopColorlessGpuBatchMetrics metrics, double elapsedMs) =>
+        metrics with
+        {
+            UploadMs = metrics.UploadMs + elapsedMs,
+            CanonicalAbi1ReadyMs = metrics.CanonicalAbi1ReadyMs + elapsedMs
+        };
     private FamilyCandidateSet? ExecuteCore(FamilyCandidateSet input, int inputCount, CancellationToken cancellationToken, out MerchantShopColorlessGpuBatchMetrics metrics)
     {
         AssertOwnerThread();
@@ -340,16 +401,20 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
         timer.Stop();
         double commandMs = timer.Elapsed.TotalMilliseconds;
 
-        (double submitMs, double syncMs) = FamilyGpuComputeUtility.SubmitAndSync(_rd, "S.MerchantShopColorless");
+        timer.Restart();
+        uint[] header = _headerReadback.CompleteRecorded(_outputHeader, HeaderUIntCount,
+            true, "S.MerchantShopColorless", static () => { });
+        timer.Stop();
+        double submitMs = _headerReadback.LastSubmitMs, syncMs = _headerReadback.LastSyncMs;
+        double headerTransportMs = Math.Max(0, timer.Elapsed.TotalMilliseconds - submitMs - syncMs);
         cancellationToken.ThrowIfCancellationRequested();
 
         timer.Restart();
-        byte[] rawHeader = _rd.BufferGetData(_outputHeader, 0u, HeaderUIntCount * sizeof(uint));
-        uint[] header = FamilyGpuComputeUtility.FromUInt32Bytes(rawHeader);
+        long headerReadBytes = (long)header.Length * sizeof(uint);
         int processedCount = ValidateHeader(header, inputCount);
         int survivorCount = checked((int)header[2]);
         timer.Stop();
-        double headerReadbackMs = timer.Elapsed.TotalMilliseconds;
+        double headerReadbackMs = headerTransportMs + timer.Elapsed.TotalMilliseconds;
 
         if (_privateOutput is not null)
         {
@@ -358,7 +423,7 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
                 CompactionPath = MerchantShopColorlessCompactionPath.AtomicAppendHostSort,
                 InputCandidates = inputCount, ProcessedCandidates = processedCount, Survivors = survivorCount, Dispatches = 1,
                 UploadMs = uploadMs, CommandMs = commandMs, SubmitMs = submitMs, SyncMs = syncMs,
-                HeaderReadbackMs = headerReadbackMs, HeaderReadbackBytes = rawHeader.LongLength,
+                HeaderReadbackMs = headerReadbackMs, HeaderReadbackBytes = headerReadBytes,
                 CanonicalAbi1ReadyMs = canonicalTimer.Elapsed.TotalMilliseconds
             };
             return null;
@@ -402,7 +467,7 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
             headerReadbackMs, payloadReadbackMs,
             typedAllocationMs, decodePayloadMs, sortMs, validationCandidateSetMs,
             payloadReadbackAllocatedBytes, hostAllocatedBytes,
-            rawHeader.LongLength, rawOrdinals.LongLength,
+            headerReadBytes, rawOrdinals.LongLength,
             0d, 0d, 0d, 0d, 0d, 0d, 0d, 0d, 0d, 0L,
             canonicalTimer.Elapsed.TotalMilliseconds, 1);
         return result;
@@ -442,16 +507,20 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
         timer.Stop();
         double phase1CommandMs = timer.Elapsed.TotalMilliseconds;
 
-        (double phase1SubmitMs, double phase1SyncMs) = FamilyGpuComputeUtility.SubmitAndSync(_rd, "S.StablePhase1");
+        timer.Restart();
+        uint[] phase1Header = _headerReadback.CompleteRecorded(_outputHeader, HeaderUIntCount,
+            true, "S.StablePhase1", static () => { });
+        timer.Stop();
+        double phase1SubmitMs = _headerReadback.LastSubmitMs, phase1SyncMs = _headerReadback.LastSyncMs;
+        double phase1HeaderTransportMs = Math.Max(0, timer.Elapsed.TotalMilliseconds - phase1SubmitMs - phase1SyncMs);
         cancellationToken.ThrowIfCancellationRequested();
 
         timer.Restart();
-        byte[] phase1RawHeader = _rd.BufferGetData(_outputHeader, 0u, HeaderUIntCount * sizeof(uint));
-        uint[] phase1Header = FamilyGpuComputeUtility.FromUInt32Bytes(phase1RawHeader);
+        long phase1HeaderReadBytes = (long)phase1Header.Length * sizeof(uint);
         int processedCount = ValidateHeader(phase1Header, input.Count);
         int survivorCount = checked((int)phase1Header[2]);
         timer.Stop();
-        double phase1HeaderReadbackMs = timer.Elapsed.TotalMilliseconds;
+        double phase1HeaderReadbackMs = phase1HeaderTransportMs + timer.Elapsed.TotalMilliseconds;
 
         timer.Restart();
         byte[] rawCounts = _rd.BufferGetData(_stableBlockCounts, 0u, checked(groups * sizeof(uint)));
@@ -492,17 +561,21 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
         timer.Stop();
         double scatterCommandMs = timer.Elapsed.TotalMilliseconds;
 
-        (double scatterSubmitMs, double scatterSyncMs) = FamilyGpuComputeUtility.SubmitAndSync(_rd, "S.StableScatter");
+        timer.Restart();
+        uint[] finalHeader = _headerReadback.CompleteRecorded(_outputHeader, HeaderUIntCount,
+            true, "S.StableScatter", static () => { });
+        timer.Stop();
+        double scatterSubmitMs = _headerReadback.LastSubmitMs, scatterSyncMs = _headerReadback.LastSyncMs;
+        double finalHeaderTransportMs = Math.Max(0, timer.Elapsed.TotalMilliseconds - scatterSubmitMs - scatterSyncMs);
         cancellationToken.ThrowIfCancellationRequested();
 
         timer.Restart();
-        byte[] finalRawHeader = _rd.BufferGetData(_outputHeader, 0u, HeaderUIntCount * sizeof(uint));
-        uint[] finalHeader = FamilyGpuComputeUtility.FromUInt32Bytes(finalRawHeader);
+        long finalHeaderReadBytes = (long)finalHeader.Length * sizeof(uint);
         ValidateHeader(finalHeader, input.Count);
         if (checked((int)finalHeader[2]) != survivorCount)
             throw new InvalidDataException("SFamilyStableScatterChangedSurvivorCount");
         timer.Stop();
-        double finalHeaderReadbackMs = timer.Elapsed.TotalMilliseconds;
+        double finalHeaderReadbackMs = finalHeaderTransportMs + timer.Elapsed.TotalMilliseconds;
 
         long payloadAllocationBefore = GC.GetAllocatedBytesForCurrentThread();
         timer.Restart();
@@ -549,7 +622,7 @@ internal sealed partial class MerchantShopColorlessGpuExecutor : IDisposable
             validationCandidateSetMs,
             payloadReadbackAllocatedBytes,
             hostAllocatedBytes,
-            phase1RawHeader.LongLength + finalRawHeader.LongLength,
+            phase1HeaderReadBytes + finalHeaderReadBytes,
             rawOrdinals.LongLength,
             phase1CommandMs,
             phase1SubmitMs,

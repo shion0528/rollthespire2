@@ -7,7 +7,24 @@ internal static class MerchantShopColorlessPhysicalPricing
 {
     internal static FamilyPhysicalQuote? Quote(ExactSearchExecutionRequest request,
         MerchantShopColorlessCompactionDecision publicDecision, FamilyPhysicalQuoteRequest geometry,
-        FamilyExpectedFilteringCostProjection expected) => QuoteMeasured(request,publicDecision,geometry) ?? QuoteModel(request,publicDecision,geometry,expected);
+        FamilyExpectedFilteringCostProjection expected, MerchantOrderedSequenceSlotsPlan? orderedSequenceSlots = null)
+    {
+        var lowering = orderedSequenceSlots ?? MerchantShopColorlessOrderedSequencePolicy.Compile(request);
+        if (!lowering.Applied)
+            return QuoteMeasured(request, publicDecision, geometry) ?? QuoteModel(request, publicDecision, geometry, expected);
+        var physical = request with { Evaluation = lowering.Evaluation };
+        var physicalExpected = orderedSequenceSlots is not null ? expected :
+            MerchantShopColorlessExpectedFilteringCost.ProjectPhysical(request, lowering.Evaluation,
+                MerchantShopColorlessAnalyticalCost.Project(lowering.Evaluation), MerchantShopColorlessSurvival.Project(request));
+        var quote = QuoteMeasured(physical, publicDecision, geometry) ??
+            QuoteModel(physical, publicDecision, geometry, physicalExpected);
+        return quote is null ? null : quote with
+        {
+            Shape = quote.Shape + lowering.RevisionSuffix,
+            Evidence = quote.Evidence + ";GpuOrderedSequenceLoweredToEquivalentExistingSlotBody;" +
+                "PhysicalIdentity=" + MerchantShopColorlessOrderedSequencePolicy.Revision + ";OriginalQueryAndScalarSurvivalUnchanged"
+        };
+    }
 
     private static FamilyPhysicalQuote? QuoteMeasured(ExactSearchExecutionRequest request,
         MerchantShopColorlessCompactionDecision publicDecision, FamilyPhysicalQuoteRequest geometry)
@@ -49,7 +66,7 @@ internal static class MerchantShopColorlessPhysicalPricing
         var e=request.Evaluation;
         if(!FamilyPhysicalQuote.AdmittedRequest(g) || !FamilyPhysicalQuote.HasReferenceBackend() || !ModelAuthority(request) ||
             !expected.IsResolved || expected.FinalSurvival is not (>=0 and <=.15) ||
-            e.MerchantColorlessConditions.Count>5 || e.MerchantColorlessSequenceConditions.Count>2 || g.MeanInputPopulation<1048576) return null;
+            e.MerchantColorlessConditions.Count>5 || e.MerchantColorlessSequenceConditions.Count>2) return null;
         var replay=expected.Segments.Where(s=>s.Operation==FamilyAnalyticalOperation.RngAdvance &&
             s.Name.StartsWith("S.MerchantReplay[",StringComparison.Ordinal)).ToArray();
         if(replay.Length is <1 or >5) return null;
@@ -61,12 +78,19 @@ internal static class MerchantShopColorlessPhysicalPricing
         if(stable && g.MeanInputPopulation<4194304) return null;
         int extraRows = Math.Max(0, e.MerchantColorlessSequenceConditions.Count + (e.MerchantColorlessConditions.Count > 0 ? 1 : 0) - 1);
         double ns=.1+.12*visits+(g.CompactInput?.3:0)+(stable?.06:0)+.04*extraRows;
+        bool sparse = g.MeanInputPopulation < CompactSparseGpuPricing.DenseAnchorPopulation;
+        double? fixedMs = sparse ? CompactSparseGpuPricing.AdditionalFixedMilliseconds(
+            SearchOptimizationScope.Current.CostOrderedFilters, g.CompactInput, g.MeanInputPopulation, ns) : 0;
+        if (fixedMs is null) return null;
         int capacity=!g.PrivateInput&&!g.PrivateOutput?MerchantShopColorlessGpuExecutor.SurvivorCapacity:MerchantShopColorlessGpuExecutor.Capacity;
-        return new("S.MerchantShopColorless","S.MerchantWork.20260913.v1."+(stable?"Stable":"Atomic"),ns,capacity,100,
+        return new("S.MerchantShopColorless","S.MerchantWork.20260913.v1."+(stable?"Stable":"Atomic") +
+            (sparse ? "." + CompactSparseGpuPricing.Revision : ""),ns,capacity,100,
             "FamilyCostClosure.20260913;Model=BoundedCoarse;ReferenceLaneReach32;ScalarSurvivalUnchanged;"+
             "SlotsAndSequences;SharedMerchantTraversal;Horizon1..5;Survival<=.15;NumericalDeviceEmission;HostPayloadExcluded;metric=ns/ActualStageInput;" +
-            (extraRows > 0 ? "ConservativeCoarse" : "ValidatedMerchantRegion"),
-            OutputElementBytes:g.PrivateOutput?4:8,OutputAlreadyOrdered:stable);
+            (extraRows > 0 ? "ConservativeCoarse" : "ValidatedMerchantRegion") +
+            (sparse ? ";" + CompactSparseGpuPricing.Evidence : ""),
+            OutputElementBytes:g.PrivateOutput?4:8,OutputAlreadyOrdered:stable)
+        { FixedWindowMilliseconds = fixedMs.Value };
     }
 
     internal static FamilyPhysicalQuote? QuoteCpuSlots(ExactSearchExecutionRequest request,FamilyPhysicalQuoteRequest g)

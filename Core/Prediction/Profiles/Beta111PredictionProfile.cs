@@ -37,7 +37,20 @@ public sealed class Beta111PredictionProfile : ISeedPredictionProfile
     }
 
     internal SeedPredictionDocument PredictFromRootHash(SeedPredictionRequest request, GameVersionDetection detection, TrustedRootHashInput input)
+        => PredictFromRootHashCore(request, detection, input, null, captureOpening: false, out _);
+
+    internal SeedPredictionDocument PredictFromRootHashCapturingOpening(SeedPredictionRequest request,
+        GameVersionDetection detection, TrustedRootHashInput input, out Beta111NeowOpeningProof? opening) =>
+        PredictFromRootHashCore(request, detection, input, null, captureOpening: true, out opening);
+
+    internal SeedPredictionDocument PredictFromRootHashReusingOpening(SeedPredictionRequest request,
+        GameVersionDetection detection, TrustedRootHashInput input, Beta111NeowOpeningProof opening) =>
+        PredictFromRootHashCore(request, detection, input, opening, captureOpening: false, out _);
+
+    private SeedPredictionDocument PredictFromRootHashCore(SeedPredictionRequest request, GameVersionDetection detection,
+        TrustedRootHashInput input, Beta111NeowOpeningProof? suppliedOpening, bool captureOpening, out Beta111NeowOpeningProof? capturedOpening)
     {
+        capturedOpening = null;
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(detection);
         if (request.TrustedRootHashInput is not { } requestInput || requestInput != input)
@@ -46,11 +59,16 @@ public sealed class Beta111PredictionProfile : ISeedPredictionProfile
         if (input.HasCanonicalSeed && Beta111Profile.Instance.ComputeRootSeed(input.CanonicalSeed) != input.RootHash)
             return Fail(request, detection, input.SeedIdentity, PredictionWarningCode.InvalidRequestContext, SeedPredictionOverallStatus.Unknown,
                 new PredictionDiagnostic("trusted-root-hash-forward-validation", "failed"));
-        return PredictCore(request, detection, input);
+        return PredictCore(request, detection, input, suppliedOpening, captureOpening, out capturedOpening);
     }
 
-    private SeedPredictionDocument PredictCore(SeedPredictionRequest request, GameVersionDetection detection, TrustedRootHashInput input)
+    private SeedPredictionDocument PredictCore(SeedPredictionRequest request, GameVersionDetection detection, TrustedRootHashInput input) =>
+        PredictCore(request, detection, input, null, captureOpening: false, out _);
+
+    private SeedPredictionDocument PredictCore(SeedPredictionRequest request, GameVersionDetection detection, TrustedRootHashInput input,
+        Beta111NeowOpeningProof? suppliedOpening, bool captureOpening, out Beta111NeowOpeningProof? capturedOpening)
     {
+        capturedOpening = null;
         if (!ContextMatches(request, detection))
             return Fail(request, detection, input.SeedIdentity, PredictionWarningCode.InvalidRequestContext, SeedPredictionOverallStatus.Unknown);
         if (request.Authority.NoRunModifiers == false)
@@ -75,10 +93,18 @@ public sealed class Beta111PredictionProfile : ISeedPredictionProfile
             if (!request.Authority.HasExactModernNeowIdentityInputs)
                 return Fail(request, detection, input.SeedIdentity, PredictionWarningCode.SnapshotAuthorityIncomplete, SeedPredictionOverallStatus.Unknown);
 
+            bool reusedOpening = false;
+            bool exactAuthority;
             try
             {
-                result = _identityPredictor(
-                    input.RootHash, request.Authority, Beta111Profile.Instance, request.Authority.IsBeta111NeowIdentityAuthorityExact);
+                exactAuthority = request.Authority.IsBeta111NeowIdentityAuthorityExact;
+                if (suppliedOpening is not null && suppliedOpening.TryReuse(this, _identityPredictor, Beta111Profile.Instance,
+                        request, detection, input, compatibility, exactAuthority, out var knownIdentity, out var knownChoices, out var knownPrecision))
+                {
+                    result = knownIdentity; choices = knownChoices; identityPrecision = knownPrecision; reusedOpening = true;
+                }
+                else
+                    result = _identityPredictor(input.RootHash, request.Authority, Beta111Profile.Instance, exactAuthority);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -86,24 +112,30 @@ public sealed class Beta111PredictionProfile : ISeedPredictionProfile
                     new PredictionDiagnostic(PredictionDiagnosticCodes.Exception, ex.ToString()));
             }
 
-            identityPrecision = !result.ExactAuthority
-                ? PredictionPrecision.Unknown
-                // Exact under the selected ruleset and captured inputs does not
-                // claim that an unverified game version has been runtime-accepted.
-                : Beta111ValidationAuthority.RuntimeAccepted && compatibility.AllowsProductionSearch &&
-                  !compatibility.Blocks(CompatibilityDomainMask.Neow)
-                    ? PredictionPrecision.Exact
-                    : PredictionPrecision.Partial;
+            if (!reusedOpening)
+            {
+                identityPrecision = !result.ExactAuthority
+                    ? PredictionPrecision.Unknown
+                    // Exact under the selected ruleset and captured inputs does not
+                    // claim that an unverified game version has been runtime-accepted.
+                    : Beta111ValidationAuthority.RuntimeAccepted && compatibility.AllowsProductionSearch &&
+                      !compatibility.Blocks(CompatibilityDomainMask.Neow)
+                        ? PredictionPrecision.Exact
+                        : PredictionPrecision.Partial;
 
-            choices = request.PartyOpeningChoices?.ToArray() ?? result.RelicKeys.Select((key, index) =>
-                SeedPredictionDocumentFactory.Choice(
-                    index + 1,
-                    key,
-                    request,
-                    identityPrecision,
-                    "beta111.shared-modern-neow-identity",
-                    Beta111NeowEffectProjector.ProjectFromRootHash(key, identityPrecision, request.Authority, input.RootHash, request.EnableComplexBonesDeckInteractions)))
-                .ToArray();
+                choices = request.PartyOpeningChoices?.ToArray() ?? result.RelicKeys.Select((key, index) =>
+                    SeedPredictionDocumentFactory.Choice(
+                        index + 1,
+                        key,
+                        request,
+                        identityPrecision,
+                        "beta111.shared-modern-neow-identity",
+                        Beta111NeowEffectProjector.ProjectFromRootHash(key, identityPrecision, request.Authority, input.RootHash, request.EnableComplexBonesDeckInteractions)))
+                    .ToArray();
+            }
+            if (captureOpening)
+                capturedOpening = Beta111NeowOpeningProof.TryCreate(this, _identityPredictor, Beta111Profile.Instance,
+                    request, detection, input, compatibility, exactAuthority, result, choices, identityPrecision);
 
             warnings.AddRange(choices.SelectMany(choice => choice.Warnings));
             if (result.UnknownEligibilityAffectedPool)
@@ -117,7 +149,7 @@ public sealed class Beta111PredictionProfile : ISeedPredictionProfile
         WorldPredictionResult? worldPrediction = request.Includes(SeedPredictionDomainSelection.World)
             ? WorldPredictionEngine.PredictFromRootHash(Beta111Profile.Instance, input.RootHash, input.SeedIdentity, request.Ascension,
                 request.Authority.PlayerSlotIndex, request.Character.CharacterKey, request.Authority.WorldAuthority,
-                request.Authority.EffectAuthority, request.AncientOptionConditions)
+                request.Authority.EffectAuthority, request.AncientOptionConditions, request.WorldProjection)
             : null;
         RelicSequencePredictionResult? relicPrediction = request.Includes(SeedPredictionDomainSelection.RelicSequence)
             ? RelicSequencePredictor.PredictFromRootHash(Beta111Profile.Instance, input.RootHash, input.SeedIdentity,
@@ -126,7 +158,7 @@ public sealed class Beta111PredictionProfile : ISeedPredictionProfile
         NormalCombatRewardSequencePredictionResult? rewardPrediction = request.Includes(SeedPredictionDomainSelection.NormalCombatRewards)
             ? NormalCombatRewardSequencePredictor.PredictFromRootHash(Beta111Profile.Instance, input.RootHash, input.SeedIdentity,
                 request.Authority.PlayerSlotIndex, request.Ascension, choices, request.Authority.EffectAuthority,
-                request.Authority.WorldAuthority, request.CombatRewardProjectionRequest)
+                request.Authority.WorldAuthority, request.CombatRewardProjectionRequest, request.PreparedRewardPools)
             : null;
 
         PredictionWarning[] distinctWarnings = warnings.Distinct().ToArray();

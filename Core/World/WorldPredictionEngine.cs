@@ -71,7 +71,8 @@ public static class WorldPredictionEngine
         ModelKey characterKey,
         WorldAuthoritySnapshot? world,
         NeowEffectAuthoritySnapshot? effects,
-        AncientOptionConditionProfile? ancientOptionConditions = null)
+        AncientOptionConditionProfile? ancientOptionConditions = null,
+        WorldPredictionProjection projection = WorldPredictionProjection.All)
     {
         ArgumentNullException.ThrowIfNull(profile);
         if (world is null || world.CapturedProfileId != profile.ProfileId)
@@ -90,7 +91,8 @@ public static class WorldPredictionEngine
             playerSlotIndex,
             characterKey,
             world,
-            ancientOptionConditions ?? AncientOptionConditionProfile.BroadDefault);
+            ancientOptionConditions ?? AncientOptionConditionProfile.BroadDefault,
+            projection);
     }
 
     private static string WorldProviderDiagnosticPrefix(RuntimeProfileId profileId) => profileId switch

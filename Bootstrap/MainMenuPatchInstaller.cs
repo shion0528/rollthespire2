@@ -7,7 +7,7 @@ using RolltheSpire2.Ui.Shell;
 
 namespace RolltheSpire2.Bootstrap;
 
-internal static class MainMenuPatchInstaller
+internal static partial class MainMenuPatchInstaller
 {
     private static readonly string[] MainMenuTypeNames =
     {
@@ -87,6 +87,7 @@ internal static class MainMenuPatchInstaller
                 RuntimeLog.WarnException("runtimeAuthorityCaptureFailed=true;failSoft=true", ex);
             }
             MinimalPanelInjector.EnsureAttached(mainMenu, ModRuntime.Snapshot);
+            ActualSearchBenchmarkRequested(mainMenu);
         }
     }
 
@@ -104,4 +105,6 @@ internal static class MainMenuPatchInstaller
         try { InRunPredictionLauncher.EnsureAttached(__instance, runState, ModRuntime.Snapshot); }
         catch (Exception ex) { RuntimeLog.WarnException("runPredictionLauncherAttachFailed=true", ex); }
     }
+
+    static partial void ActualSearchBenchmarkRequested(Node mainMenu);
 }

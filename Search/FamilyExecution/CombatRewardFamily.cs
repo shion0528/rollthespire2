@@ -18,6 +18,7 @@ internal sealed partial class CombatRewardFamily : IFamilyInvocation
     IEnumerable<GpuLocalPeak> IFamilyInvocation.CostPeaks => _costSamples.Peaks;
     void IFamilyInvocation.LogExecutionEvidence() => _costSamples.WriteSummary();
     private readonly FamilyCpuExecution _cpu;
+    private readonly FamilyHeaderTransportPerformance _headerTransport;
     private readonly ExactSearchExecutionRequest _request;
     private readonly CombatRewardGpuPlan? _gpuPlan;
     internal CombatRewardGpuPlan? GpuPlan => _gpuPlan;
@@ -32,6 +33,8 @@ internal sealed partial class CombatRewardFamily : IFamilyInvocation
 
     private CombatRewardFamily(ExactSearchExecutionRequest request, int? precedingNicheDraws = 0)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
+        _headerTransport = new(request.RunOptions.Optimizations);
         _request = request;
         Replay = new(request, precedingNicheDraws);
         _gpuPlan = CombatRewardGpuPlan.TryCreate(request, Replay, out string gpuIssue);
@@ -50,8 +53,11 @@ internal sealed partial class CombatRewardFamily : IFamilyInvocation
     }
 
     public string FamilyId => "C.CombatReward";
-    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest request) =>
-        CombatRewardPhysicalPricing.Quote(_request, Replay, _gpuPlan, request);
+    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest request)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return CombatRewardPhysicalPricing.Quote(_request, Replay, _gpuPlan, request);
+    }
     bool IFamilyInvocation.CanBindPrivateSerial => _gpuPlan is not null;
     FamilyPhysicalQuote? IFamilyInvocation.QuoteCommonPrivateWorkCancellation(FamilyPhysicalQuoteRequest g) =>
         _gpuPlan is null || !FamilyPhysicalQuote.AdmittedRequest(g) || !FamilyPhysicalQuote.HasReferenceBackend() ? null :
@@ -63,6 +69,7 @@ internal sealed partial class CombatRewardFamily : IFamilyInvocation
     {
         if (_gpuPlan is null) throw new InvalidOperationException("C.PrivateSerialNotAdmitted");
         var gpu = new CombatRewardGpuExecutor(rd, _gpuPlan, privateInput: input, privateOutput: output);
+        _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
         return new(gpu, gpu.Device, gpu.SetupMs, input, output, (batch, count, token) =>
         {
             FamilyCandidateSet? result = null; CombatRewardGpuMetrics m;
@@ -72,6 +79,7 @@ internal sealed partial class CombatRewardFamily : IFamilyInvocation
                 else gpu.ExecutePrivateStage(batch, count, token, out m);
             }
             else result = input is null ? gpu.Execute(FamilyCandidateSet.Dense(batch), token, out m) : gpu.ExecutePrivateInput(batch, count, token, out m);
+            _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
             return new(m.Output, result, m.DispatchSyncMs, m.ReadbackMs, m.ReadbackBytes, m.CanonicalMs, m.Dispatches);
         });
     }
@@ -82,14 +90,18 @@ internal sealed partial class CombatRewardFamily : IFamilyInvocation
     public FamilyExpectedFilteringCostProjection ExpectedFilteringCost => _models.Expected(EmptyCoverage);
     public FamilyExpectedFilteringCostProjection ResolveExpectedFilteringCost(IReadOnlySet<string> passedCoverage) => _models.Expected(passedCoverage);
     public FamilyConditionPerformanceProjection ConditionPerformance => ResolveConditionPerformance(false);
-    public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compactAbi1Input) => _gpuPlan is null
-        ? _cpu.Condition(compactAbi1Input) : new(FamilyId,_gpuPlan.Revision(compactAbi1Input),
-            "C.Neutral.20260907.v1",1,"NoAcceptedWithinPathCurve;CanonicalAbi1Ready",usesGpu:true);
+    public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compactAbi1Input)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return _gpuPlan is null ? _cpu.Condition(compactAbi1Input) : _headerTransport.Apply(
+            new(FamilyId,_gpuPlan.Revision(compactAbi1Input), "C.Neutral.20260907.v1",1,
+                "NoAcceptedWithinPathCurve;CanonicalAbi1Ready",usesGpu:true), _gpu?.HeaderReadbackRevision);
+    }
     public FamilyPerformanceObservation CapturePerformanceObservation() => _gpuPlan is null ? _cpu.Observation() :
         new(ResolveConditionPerformance(_compact),_gpu?.Device??"",_gpu?.SetupMs??0,_peak,_peak,_batches,Math.Max(0,_batches-1),
             _inputs,_outputs,_canonicalMs,_parity&&!_faulted&&_batches>1,"CanonicalAbi1Ready;FirstBatchExcluded;CpuReferenceParity="+_parity);
     public FamilyLivePerformanceSnapshot? CaptureLivePerformanceSnapshot() => _gpuPlan is null ? _cpu.Live() :
-        _faulted||!_parity||_batches<2?null:new(FamilyId,_gpuPlan.Revision(_compact),Interlocked.Read(ref _liveInputs),Volatile.Read(ref _liveMs),_batches-1);
+        _faulted||!_parity||_batches<2?null:new(FamilyId,ResolveConditionPerformance(_compact).PhysicalImplementationRevision,Interlocked.Read(ref _liveInputs),Volatile.Read(ref _liveMs),_batches-1);
     public async ValueTask<FamilyCandidateSet> InvokeAsync(FamilyExecutionContext executionContext,
         FamilyObservationWindow observationWindow, FamilyCandidateSet input, CancellationToken cancellationToken)
     {

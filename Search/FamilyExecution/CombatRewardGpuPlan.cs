@@ -8,12 +8,14 @@ namespace RolltheSpire2.Search.FamilyExecution;
 internal sealed record CombatRewardGpuPlan(uint[] Meta, uint[] Pools, uint[] Ids, uint[] Predicates,
     uint[] Targets, Beta110GpuCombatRewardHotLoopPlan HotLoop, int Routes)
 {
+    private readonly string _sharedPrefixRevision = SharedVisibleSeedGpuCache.RevisionSuffix;
     internal bool UsesHotLoop => HotLoop.Enabled;
     internal string Revision(bool compact) => "C.CombatReward.Gpu." + (UsesHotLoop ? "NeutralHotLoop" : "GenericStreaming") +
-        (compact ? ".CompactAbi1" : ".Dense") + ".CanonicalAbi1Ready.20260907.v1";
+        (compact ? ".CompactAbi1" : ".Dense") + ".CanonicalAbi1Ready.20260907.v1" + _sharedPrefixRevision;
 
     internal static CombatRewardGpuPlan? TryCreate(ExactSearchExecutionRequest request, CombatRewardReplay replay, out string issue)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
         issue = "";
         var reward = replay.Plan;
         // Physical bounds of the retained donor, not Search admission gates.

@@ -17,6 +17,9 @@ public interface IProductionSearchSession : IAsyncDisposable
     Task Completion { get; }
     void Cancel();
     bool TryReadCandidate(out SearchCandidate? candidate);
+    int PendingCandidateCount => -1;
+    ValueTask<bool> WaitToReadCandidateAsync(CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException("This search session does not expose asynchronous candidate readiness.");
     SearchProgressSnapshot GetProgress();
     SearchDiagnosticSummarySnapshot GetDiagnosticSummary();
     ulong GetSafeNextOrdinal();
@@ -116,6 +119,7 @@ public sealed class ProductionSearchSession : IProductionSearchSession
         Func<int, CancellationToken, ValueTask>? beforeCandidatePublish = null)
     {
         _plan = plan ?? throw new ArgumentNullException(nameof(plan));
+        using var optimizationScope = SearchOptimizationScope.Enter(_plan.RunOptions.Optimizations);
         _exactEvaluator = exactEvaluator ?? ((request, input) => ProductionExactSearchEvaluator.Evaluate(request, input, _lifetime.Token));
         _beforeCandidatePublish = beforeCandidatePublish;
         _executionPlan = executionPlan ?? throw new ArgumentNullException(nameof(executionPlan));
@@ -128,7 +132,8 @@ public sealed class ProductionSearchSession : IProductionSearchSession
             if(family is FamilyCpuExecution cpu)cpu.BindCalibrationCoverage(calibrationCoverage);
             calibrationCoverage.UnionWith(family.Coverage);
         }
-        _executionContext = new FamilyExecutionContext(requiresGpu: _families.Any(family => family.ConditionPerformance.UsesGpu), failOnPhysicalRecovery);
+        _executionContext = new FamilyExecutionContext(requiresGpu: _families.Any(family => family.ConditionPerformance.UsesGpu), failOnPhysicalRecovery,
+            plan.RunOptions.Resources, plan.WorkerCount, plan.RunOptions.Optimizations);
         if (executionWindowSize <= 0) throw new ArgumentOutOfRangeException(nameof(executionWindowSize));
         _executionWindowSize = executionWindowSize;
         if (queueCapacity <= 0) throw new ArgumentOutOfRangeException(nameof(queueCapacity));
@@ -170,6 +175,9 @@ public sealed class ProductionSearchSession : IProductionSearchSession
     }
 
     public bool TryReadCandidate(out SearchCandidate? candidate) => _candidates.Reader.TryRead(out candidate);
+    public int PendingCandidateCount => _candidates.Reader.CanCount ? _candidates.Reader.Count : -1;
+    public ValueTask<bool> WaitToReadCandidateAsync(CancellationToken cancellationToken = default) =>
+        _candidates.Reader.WaitToReadAsync(cancellationToken);
 
     private long _scanFirstCompletedTimestamp, _scanLastCompletedTimestamp, _scanAfterFirstRoots;
     public SearchProgressSnapshot GetProgress()
@@ -222,6 +230,7 @@ public sealed class ProductionSearchSession : IProductionSearchSession
 
     private async Task RunAsync()
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(_executionContext.Optimizations);
         try
         {
             if (!VisibleSeedCandidateCodec.TryParseOrdinal(_profile, _plan.CanonicalStartSeed, out ulong startOrdinal, out _, out string issue))
@@ -232,7 +241,10 @@ public sealed class ProductionSearchSession : IProductionSearchSession
                 $"familyExecutionStarted=true;spine=FamilyExecution;families={_families.Count};" +
                 $"familyIds={string.Join(",", _families.Select(family => family.FamilyId))};abi=ABI1-BatchLocalLogicalOrdinal;" +
                 $"start={_plan.CanonicalStartSeed};count={_plan.ScanCount};workers={_plan.WorkerCount};" +
-                $"executionWindowSize={_executionWindowSize};skipExactValidation={_plan.RunOptions.SkipExactValidation}");
+                $"executionWindowSize={_executionWindowSize};skipExactValidation={_plan.RunOptions.SkipExactValidation};" +
+                $"cpuBudgetPercent={_plan.RunOptions.Resources?.CpuPercent.ToString() ?? "Legacy"};" +
+                $"gpuDutyCyclePercent={_plan.RunOptions.Resources?.GpuPercent ?? 100};" +
+                "utilizationTargetIsBudget=true;syntheticLoad=false");
             RuntimeLog.TryBackgroundInfo("familyPlannerDecision=true;" + _executionPlan.FormatSummary());
             RuntimeLog.TryBackgroundInfo(_etaProjection.FormatSummary() + ";phase=SelectedProductionPlan");
             var passedCoverage = new HashSet<string>(StringComparer.Ordinal);
@@ -637,6 +649,8 @@ public sealed class ProductionSearchSession : IProductionSearchSession
         }
         else
         {
+            using var cpuScope = _executionContext.EnterCpuBudget();
+            using var cpuSlot = SearchCpuConcurrencyBudget.Acquire(cancellationToken);
             Interlocked.Increment(ref _exactAttempts);
             long exactAttemptStarted = Stopwatch.GetTimestamp();
             try

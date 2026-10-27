@@ -3,6 +3,7 @@ using RolltheSpire2.Presentation.Ui1;
 using RolltheSpire2.Search.Compilation;
 using RolltheSpire2.Search.Contracts;
 using RolltheSpire2.Search.FamilyExecution;
+using RolltheSpire2.Search.Runtime;
 using RolltheSpire2.Search.Selectivity;
 using RolltheSpire2.Search.Semantics;
 
@@ -19,8 +20,14 @@ internal sealed record WorkbenchProbabilityPreview(
     IReadOnlyDictionary<EventResultSearchCondition, (SearchSelectivityEstimate Estimate, double? Cpu, double? Gpu)> Events,
     IReadOnlyList<string> Issues)
 {
-    internal static WorkbenchProbabilityPreview Compute(CompiledSearch compiled, int target, int workers, bool cpuOnly)
+    internal static WorkbenchProbabilityPreview Compute(CompiledSearch compiled, int target, int workers, bool cpuOnly,
+        SearchResourceBudget? resources = null, SearchOptimizationSettings? optimizations = null)
     {
+        optimizations ??= SearchOptimizationSettings.AllEnabled;
+        using var optimizationScope = SearchOptimizationScope.Enter(optimizations);
+        resources = resources?.Normalize();
+        if (resources is not null) workers = resources.ResolveCpuWorkers(System.Environment.ProcessorCount);
+        cpuOnly |= resources?.GpuPercent == 0;
         var input = SearchSelectivityInput.From(compiled);
         var joint = JointSelectivityEstimator.EstimateQuery(input);
         var costs = new Dictionary<string, (double? Cpu, double? Gpu)>();
@@ -32,13 +39,16 @@ internal sealed record WorkbenchProbabilityPreview(
         FamilySearchEtaProjectionV1? eta = null;
         try
         {
-            var execution = ExactSearchExecutionRequestFactory.Compile(compiled, new("000000000000", long.MaxValue, target, workers));
+            var execution = ExactSearchExecutionRequestFactory.Compile(compiled,
+                new SearchRunOptions("000000000000", long.MaxValue, target, workers)
+                { Resources = resources, Optimizations = optimizations });
             if (execution.Success && execution.Plan is { } request)
             {
+                request = ExactWorldProjectionPolicy.ApplyOrdinarySearchPolicy(request);
                 var selected = FamilyExecutionCoordinator.Plan(request, cpuOnly ? false : null);
                 eta = FamilySearchEtaProjectorV1.Project(request, selected);
                 var calibration = GpuCostCalibration.Capture();
-                foreach (var family in FamilyExecutionCoordinator.CreateRegisteredFamilies(request))
+                foreach (var family in FamilyExecutionCoordinator.CreateRegisteredFamilies(request, cpuOnly ? false : null))
                 {
                     var cpu = family.CpuRealizations.Select(f => f.QuotePhysicalWork(new(false, false, 1 << 20)))
                         .Where(c => c is { NanosecondsPerInput: > 0 }).OrderBy(c => c!.NanosecondsPerInput).FirstOrDefault();
@@ -58,8 +68,11 @@ internal sealed record WorkbenchProbabilityPreview(
             try
             {
                 var single = SearchCompiler.Compile(q with { EventResultConditions = [c] }, compiled.Context);
-                var request = ExactSearchExecutionRequestFactory.Compile(single, new("000000000000", 1 << 20, 1, workers));
-                if (request.Plan is { } plan && EventResultFamily.TryCreate(plan, out var family) && family is not null)
+                var request = ExactSearchExecutionRequestFactory.Compile(single,
+                    new SearchRunOptions("000000000000", 1 << 20, 1, workers)
+                    { Resources = resources, Optimizations = optimizations });
+                if (request.Plan is { } plan && EventResultFamily.TryCreate(
+                        ExactWorldProjectionPolicy.ApplyOrdinarySearchPolicy(plan), out var family) && family is not null)
                 {
                     var cpu = family.CpuRealizations.Select(f => f.QuotePhysicalWork(new(false, false, 1 << 20))).FirstOrDefault(v => v is not null);
                     var gpu = !cpuOnly && family.ConditionPerformance.UsesGpu ? family.QuotePhysicalWork(new(false, false, 1 << 20)) : null;
@@ -78,14 +91,16 @@ internal sealed record WorkbenchProbabilityPreview(
 // the pending request; an old completion can never overwrite the current query.
 internal sealed class WorkbenchProbabilityPreviewQueue
 {
-    internal sealed record Request(string Key, CompiledSearch Compiled, int Target, int Workers, bool CpuOnly);
+    internal sealed record Request(string Key, CompiledSearch Compiled, int Target, int Workers, bool CpuOnly,
+        SearchResourceBudget? Resources = null, SearchOptimizationSettings? Optimizations = null);
     internal sealed record Completion(Request Request, WorkbenchProbabilityPreview? Preview, Exception? Error, double Milliseconds);
     private readonly Func<Request, WorkbenchProbabilityPreview> _compute;
     private Request? _latest;
     private Task<Completion>? _running;
 
     internal WorkbenchProbabilityPreviewQueue(Func<Request, WorkbenchProbabilityPreview>? compute = null) =>
-        _compute = compute ?? (r => WorkbenchProbabilityPreview.Compute(r.Compiled, r.Target, r.Workers, r.CpuOnly));
+        _compute = compute ?? (r => WorkbenchProbabilityPreview.Compute(r.Compiled, r.Target, r.Workers, r.CpuOnly,
+            r.Resources, r.Optimizations));
 
     internal void Submit(Request request)
     {

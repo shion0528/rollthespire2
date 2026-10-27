@@ -15,12 +15,15 @@ internal sealed class WorldFamilyGpuPlan
     internal long GroupingWorkspaceBytes => (GroupingK - 1) * (Capacity * 8L + 64) + (GroupingK > 1 ? GroupingK * 32 : 0);
     internal int ScratchWords { get; }
     private readonly bool _soloConstants;
+    private readonly bool _sharedPrefixRequested = SharedVisibleSeedGpuCache.Requested;
     internal long ScratchBytes => Math.Max(4, Capacity * ScratchWords * 4L);
     internal long WorkspaceBytes => Capacity * 8L + ScratchBytes + 64 + GroupingWorkspaceBytes +
-        Buffers.Where((_, i) => i is not (0 or 12 or 16 or 17 or 18)).Sum(b => Math.Max(4, b.Length * 4L));
+        Buffers.Where((_, i) => i is not (0 or 12 or 16 or 17 or 18)).Sum(b => Math.Max(4, b.Length * 4L)) +
+        (_sharedPrefixRequested ? SharedVisibleSeedGpuCache.Bytes : 0);
     internal string Revision(bool compact) => "W.World.Gpu." + (VariantOnly ? "Variant" : "Progression") +
         (compact ? ".CompactAbi1" : ".Dense") + $".K{GroupingK}." +
-        (_soloConstants ? "SoloConstants.CanonicalAbi1Ready.20260929.v3" : "CanonicalAbi1Ready.20260907.v2");
+        (_soloConstants ? "SoloConstants.CanonicalAbi1Ready.20260929.v3" : "CanonicalAbi1Ready.20260907.v2") +
+        (_sharedPrefixRequested ? "." + SharedVisibleSeedGpuCache.Revision : "");
     internal bool VariantOnly { get; }
     internal WorldFamilyGpuPlan(WorldFamilyReplay replay, bool specializeSolo = false)
     {

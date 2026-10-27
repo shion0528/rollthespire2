@@ -11,9 +11,12 @@ internal sealed class WorldFamilyGpuExecutor : IDisposable
 {
     internal int Capacity { get; }
     private readonly RenderingDevice _rd;
+    private readonly FamilyGpuHeaderReadback _headerReadback;
+    internal string HeaderReadbackRevision => _headerReadback.Revision;
     private readonly List<Rid> _owned = new();
     private readonly Rid[] _batch, _header, _input, _output, _uniforms;
     private readonly Rid _pipeline, _headerBank;
+    private readonly SharedVisibleSeedGpuCache? _seedCache;
     private readonly int _owner = System.Environment.CurrentManagedThreadId;
     private bool _disposed;
     private readonly bool _tracePrivate = EwPhysicalExperiment.Mode.Length != 0 || PrivateOrdinalSelection.IsRequested || NwaePhysicalExperiment.Mode.Length != 0;
@@ -26,6 +29,7 @@ internal sealed class WorldFamilyGpuExecutor : IDisposable
     internal WorldFamilyGpuExecutor(RenderingDevice rd, WorldFamilyGpuPlan plan, Rid? privateInput = null, PrivateOrdinalBuffer? privateOutput = null)
     {
         _rd = rd; Capacity = plan.Capacity; GroupingK = plan.GroupingK;
+        _headerReadback = new(rd, FamilyGpuHeaderReadback.Requested);
         _privateInput = privateInput.HasValue; _privateOutput = privateOutput;
         if (privateInput.HasValue && privateOutput is not null && privateInput.Value == privateOutput.Buffer)
             throw new ArgumentException("W.PrivateBuffersAlias");
@@ -54,6 +58,7 @@ internal sealed class WorldFamilyGpuExecutor : IDisposable
                 if (!source.Contains(bound, StringComparison.Ordinal)) throw new InvalidOperationException("W.PrivateOutputSeamChanged");
                 source = source.Replace(bound, "if(p>=batch.v[7])", StringComparison.Ordinal);
             }
+            _seedCache = SharedVisibleSeedGpuCache.Attach(rd, _owned, ref source, ref buffers, "W.World");
             Rid shader = Add(FamilyGpuComputeUtility.CompileShader(rd, source, "WorldFamily"));
             _pipeline = Add(FamilyGpuComputeUtility.CreateComputePipeline(rd, shader, "W.World"));
             if (!rd.ComputePipelineIsValid(_pipeline)) throw new InvalidOperationException("W.GpuPipelineInvalid");
@@ -108,6 +113,7 @@ internal sealed class WorldFamilyGpuExecutor : IDisposable
     {
         AssertOwner(); token.ThrowIfCancellationRequested();
         var watch = Stopwatch.StartNew(); var survivors = new List<ulong>();
+        if (inputCount > 0) _seedCache?.Refresh(input.Batch);
         double dispatchSync = 0, headerRead = 0;
         double payloadRead = 0;
         int dispatches = 0, groups = 0, headerCalls = 0, payloadCalls = 0;
@@ -160,13 +166,24 @@ internal sealed class WorldFamilyGpuExecutor : IDisposable
                     if (_rd.BufferCopy(_header[slot], _headerBank, 0, (uint)(slot * 32), 32) != Error.Ok)
                         throw new InvalidOperationException($"W.HeaderBankCopyFailure:batch={input.Batch.BatchBase};offset={offset + slot * Capacity}");
             }
-            FamilyGpuComputeUtility.SubmitAndSync(_rd, "W.World"); dispatchSync += watch.Elapsed.TotalMilliseconds - start; groups++;
+            int processedAfterGroup = offset + Math.Min(inputCount - offset, slots * Capacity);
+            bool needsHeader = !resident || processedAfterGroup == inputCount;
+            double completionStart = watch.Elapsed.TotalMilliseconds;
+            uint[]? completedHeaders = needsHeader
+                ? _headerReadback.CompleteRecorded(resident || GroupingK == 1 ? _header[0] : _headerBank,
+                    checked((uint)(resident ? 8 : slots * 8)), true, "W.World", static () => { }) : null;
+            if (!needsHeader) FamilyGpuComputeUtility.SubmitAndSync(_rd, "W.World");
+            double headerTransportMs = needsHeader ? Math.Max(0, watch.Elapsed.TotalMilliseconds - completionStart -
+                _headerReadback.LastSubmitMs - _headerReadback.LastSyncMs) : 0;
+            dispatchSync += watch.Elapsed.TotalMilliseconds - start - headerTransportMs;
+            headerRead += headerTransportMs; groups++;
             token.ThrowIfCancellationRequested();
+            if (!needsHeader) { offset = processedAfterGroup; continue; }
             start = watch.Elapsed.TotalMilliseconds;
             if (resident)
             {
-                uint[] h = FamilyGpuComputeUtility.FromUInt32Bytes(_rd.BufferGetData(_header[0], 0, 32));
-                int processed = offset + Math.Min(inputCount - offset, slots * Capacity);
+                uint[] h = completedHeaders ?? throw new InvalidDataException("W.MissingPrivateCompletedHeader");
+                int processed = processedAfterGroup;
                 if (h.Length != 8 || h[0] != 0x57464d52 || h[1] != 1 || h[5] != 0x57463031 ||
                     h[3] != 0 || h[4] != processed || h[2] > processed)
                     throw new InvalidDataException("W.PrivateHeaderFault:" + string.Join(',', h));
@@ -175,7 +192,7 @@ internal sealed class WorldFamilyGpuExecutor : IDisposable
                 offset = processed;
                 continue;
             }
-            uint[] headers = FamilyGpuComputeUtility.FromUInt32Bytes(_rd.BufferGetData(GroupingK == 1 ? _header[0] : _headerBank, 0, (uint)(slots * 32)));
+            uint[] headers = completedHeaders ?? throw new InvalidDataException("W.MissingCompletedHeaderBank");
             if (headers.Length != slots * 8) throw new InvalidDataException($"W.GpuHeaderBankLength:offset={offset}");
             for (int slot = 0; slot < slots; slot++)
             {

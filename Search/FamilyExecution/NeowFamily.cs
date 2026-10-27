@@ -19,22 +19,90 @@ internal sealed partial class NeowFamily : IFamilyInvocation
     private readonly NeowTransformationComposite? _transformations;
     private readonly double? _transformationJoint, _givenTransformations;
     private readonly NeowFamilyGpuPlan? _gpuPlan;
+    private string? _boundStagedDispatchRevision;
+    private string? _boundHeaderReadbackRevision, _boundLeafyGateRevision, _boundPrefixHashRevision;
+    private string? _boundSharedPrefixHashRevision;
+    private bool _boundSharedPrefixHashCompactInput;
+    private string? _boundStaticDrawGateRevision;
+    private string? _boundInternalFilterOrderRevision;
+    private bool _boundInternalFilterOrderObserved;
+    private string? _boundGroupOutputRevision;
+    private bool _boundGroupOutputObserved;
+    private readonly bool _requestGroupOutput;
+    private readonly NeowStructuralTrialOptions _structuralTrials;
+    private string? _boundStructuralRevision;
+    private bool _boundStructuralObserved;
+    private string HeaderReadbackRevision => _gpu?.HeaderReadbackRevision ?? _boundHeaderReadbackRevision ??
+        NeowFamilyGpuExecutor.RequestedHeaderReadbackRevision;
+    private string LeafyGateRevision => _gpu?.LeafyGateRevision ?? _boundLeafyGateRevision ??
+        NeowFamilyGpuExecutor.RequestedLeafyGateRevision;
+    private string PrefixHashRevision => _gpu?.PrefixHashRevision ??
+        (!_boundSharedPrefixHashCompactInput ? _boundPrefixHashRevision : null) ??
+        NeowFamilyGpuExecutor.RequestedPrefixHashRevision;
+    private string StagedDispatchRevision => _gpu?.StagedDispatchRevision ?? _boundStagedDispatchRevision ??
+        NeowFamilyGpuExecutor.RequestedStagedDispatchRevision;
+    private string WindowTransportRevision => _gpu?.WindowTransportRevision ?? (_boundStagedDispatchRevision is not null
+        ? NeowFamilyGpuExecutor.SingleWindowRevision : SupportsDenseWindowBatching
+            ? NeowFamilyGpuExecutor.DoubleWindowRevision : NeowFamilyGpuExecutor.SingleWindowRevision);
     internal NeowFamilyGpuPlan? GpuPlan => _composite is null && _transformations is null ? _gpuPlan : null;
     internal NeowReplayPlan PricingReplayPlan => _plan;
     internal NeowCapsuleComposite? PricingComposite => _composite;
-    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest request) => _transformations is null
-        ? NeowPhysicalPricing.Quote(this, request) : NeowTransformationPricing.Joint(_transformations, request);
+    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest request)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        bool pairedGeometry = SupportsDenseWindowBatching && !request.CompactInput && !request.PrivateInput && !request.PrivateOutput &&
+            request.MeanInputPopulation > NeowFamilyGpuExecutor.Capacity && request.MeanInputPopulation <= NeowFamilyGpuExecutor.DenseWindowBatchCapacity;
+        var physicalRequest = pairedGeometry ? request with { MeanInputPopulation = NeowFamilyGpuExecutor.Capacity } : request;
+        var quote = _transformations is null
+            ? NeowPhysicalPricing.Quote(this, physicalRequest) : NeowTransformationPricing.Joint(_transformations, physicalRequest);
+        if (quote is not null && !request.CompactInput && _gpuPlan?.UsesStagedDense == true)
+            quote = quote with { WindowCapacity = SupportsDenseWindowBatching && !request.PrivateOutput &&
+                    WindowTransportRevision == NeowFamilyGpuExecutor.DoubleWindowRevision ? PreferredDenseWindowSize : quote.WindowCapacity,
+                Evidence = quote.Evidence + ";StagedDispatch=" + StagedDispatchRevision + ";WindowTransport=" + WindowTransportRevision +
+                ";DispatchRevisionMeasured=false;DispatchReference=LegacyEstimate;NoInheritedAtlasMeasurement" +
+                (WindowTransportRevision == NeowFamilyGpuExecutor.SequentialWindowFallbackRevision
+                    ? ";OptionalSecondWorkspaceUnavailable;SingleWorkspaceSequential=true" : "") +
+                (pairedGeometry ? ";PhysicalWindowPopulation=16777216;LogicalWindowPopulation<=33554432" : "") };
+        return quote;
+    }
     bool IFamilyInvocation.CanBindPrivateSerial => _gpuPlan is not null && _composite is null && _transformations is null;
     FamilyPrivateGpuExecution IFamilyInvocation.BindPrivateSerial(Godot.RenderingDevice rd,
         PrivateOrdinalBuffer? input, PrivateOrdinalBuffer? output)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
         if (_gpuPlan is null || _composite is not null || _transformations is not null) throw new InvalidOperationException("N.PrivateSerialNotAdmitted");
-        var gpu = new NeowFamilyGpuExecutor(rd, _gpuPlan, 42, privateInput: input, privateOutput: output);
+        var gpu = new NeowFamilyGpuExecutor(rd, _gpuPlan, 42, privateInput: input, privateOutput: output,
+            useGroupOutput: _requestGroupOutput, structuralTrials: _structuralTrials);
+        _boundHeaderReadbackRevision = gpu.HeaderReadbackRevision;
+        _boundLeafyGateRevision = gpu.LeafyGateRevision;
+        _boundPrefixHashRevision = gpu.PrefixHashRevision;
+        _boundSharedPrefixHashRevision = gpu.SharedPrefixHashRevisionFor(input is not null);
+        _boundSharedPrefixHashCompactInput = input is not null;
+        _boundStaticDrawGateRevision = gpu.StaticDrawGateRevisionFor(input is not null);
+        _boundInternalFilterOrderRevision = gpu.InternalFilterOrderRevisionFor(input is not null);
+        _boundInternalFilterOrderObserved = true;
+        _boundGroupOutputRevision = gpu.GroupOutputRevisionFor(input is not null);
+        _boundGroupOutputObserved = gpu.GroupOutputObservedFor(input is not null);
+        _boundStructuralRevision = gpu.StructuralRevisionFor(input is not null);
+        _boundStructuralObserved = gpu.StructuralObservedFor(input is not null);
+        if (input is null && _gpuPlan.UsesStagedDense) _boundStagedDispatchRevision = gpu.StagedDispatchRevision;
         return new(gpu, gpu.Device, gpu.SetupMs, input, output, (batch, count, token) =>
         {
             FamilyCandidateSet? result = null; NeowFamilyGpuMetrics m;
             if (output is not null) gpu.ExecutePrivateStage(batch, count, token, out m);
             else result = input is null ? gpu.Execute(FamilyCandidateSet.Dense(batch), token, out m) : gpu.ExecutePrivate(batch, count, token, out m);
+            _boundHeaderReadbackRevision = gpu.HeaderReadbackRevision;
+            _boundLeafyGateRevision = gpu.LeafyGateRevision;
+            _boundPrefixHashRevision = gpu.PrefixHashRevision;
+            _boundSharedPrefixHashRevision = gpu.SharedPrefixHashRevisionFor(input is not null);
+            _boundSharedPrefixHashCompactInput = input is not null;
+            _boundStaticDrawGateRevision = gpu.StaticDrawGateRevisionFor(input is not null);
+            _boundInternalFilterOrderRevision = gpu.InternalFilterOrderRevisionFor(input is not null);
+            _boundInternalFilterOrderObserved = true;
+            _boundGroupOutputRevision = gpu.GroupOutputRevisionFor(input is not null);
+            _boundGroupOutputObserved = gpu.GroupOutputObservedFor(input is not null);
+            _boundStructuralRevision = gpu.StructuralRevisionFor(input is not null);
+            _boundStructuralObserved = gpu.StructuralObservedFor(input is not null);
             return new(m.Survivors, result, m.DispatchSyncMs, m.ReadbackMs, m.ReadbackBytes, m.CanonicalMs, m.Dispatches);
         });
     }
@@ -54,7 +122,10 @@ internal sealed partial class NeowFamily : IFamilyInvocation
     internal NeowFamily(ExactSearchExecutionRequest request, NeowReplayPlan plan, bool preferGpu = true, NeowCapsuleComposite? composite = null,
         NeowTransformationComposite? transformations = null)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
         _request = request; _plan = plan; _transformations = transformations;
+        _requestGroupOutput = NeowFamilyGpuExecutor.RequestGroupOutput;
+        _structuralTrials = NeowStructuralTrialOptions.Capture();
         var neowMatcher = NeowFamilyReplay.Bind(plan);
         _cpuMatcher = transformations is null ? neowMatcher : root => neowMatcher(root) && transformations.Numerical.Matches(root);
         string physicalIssue = "CpuReferenceSelected";
@@ -111,9 +182,16 @@ internal sealed partial class NeowFamily : IFamilyInvocation
         ? _models.Expected(passedCoverage) : new(FamilyId, _models.Full.WorkUnitsPerInput + _composite.Projection.Full.WorkUnitsPerInput,
             null, ResolveSurvival(passedCoverage).SurvivalProbability, 1, [], "CompositeTargetRankReachLedgerNotYetPriced");
     internal int PreferredExecutionWindowSize => _gpuPlan is null ? FamilyCpuExecution.Capacity : NeowFamilyGpuExecutor.Capacity;
+    internal bool SupportsDenseWindowBatching => _gpuPlan is { IsMultiplayer: false, UsesStagedDense: true, UsesLeafyPreGate: true } &&
+        _composite is null && _transformations is null && (_request.RunOptions.Resources?.GpuPercent ?? 100) == 100 &&
+        _request.RunOptions.Optimizations.DoubleWindowBatching &&
+        System.Environment.GetEnvironmentVariable("RT2_NEOW_SINGLE_WINDOW") != "1";
+    internal int PreferredDenseWindowSize => SupportsDenseWindowBatching
+        ? NeowFamilyGpuExecutor.DenseWindowBatchCapacity : PreferredExecutionWindowSize;
     public FamilyConditionPerformanceProjection ConditionPerformance => ResolveConditionPerformance(false);
     public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compactAbi1Input)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
         if (_gpuPlan is null) return _physical.Condition(compactAbi1Input);
         string revision = _transformations is not null
             ? NeowTransformationComposite.Revision + (compactAbi1Input ? ".Compact" : _gpuPlan.UsesStagedDense ? ".StagedDense" : ".Dense")
@@ -130,6 +208,45 @@ internal sealed partial class NeowFamily : IFamilyInvocation
             revision += ".ZeroUsedDirectIndex.20260930.v1";
         if (!_gpuPlan.IsMultiplayer && _plan.StructuredConditions.Any(c => c.SourceRelicId == Beta110FastRelicCatalog.Kaleidoscope))
             revision += ".KaleidoscopeFirstGroupReject.20260930.v1";
+        if (!compactAbi1Input && _gpuPlan.UsesStagedDense)
+            revision += "." + StagedDispatchRevision + "." + WindowTransportRevision;
+        revision += "." + HeaderReadbackRevision;
+        if (!_gpuPlan.IsMultiplayer && _gpuPlan.UsesLeafyPreGate) revision += "." + LeafyGateRevision;
+        if (!compactAbi1Input && !_gpuPlan.IsMultiplayer && _gpuPlan.UsesStagedDense && _composite is null)
+            revision += "." + PrefixHashRevision;
+        // Original Dense and shared fallback/Fused tables have distinct identities.
+        string? sharedPrefixRevision = _gpu is not null
+            ? _gpu.SharedPrefixHashRevisionFor(compactAbi1Input)
+            : _boundSharedPrefixHashCompactInput == compactAbi1Input ? _boundSharedPrefixHashRevision : null;
+        if (sharedPrefixRevision is { } sharedRevision)
+            revision += "." + sharedRevision;
+        revision += "." + (_gpu?.StaticDrawGateRevisionFor(compactAbi1Input) ??
+            (_boundSharedPrefixHashCompactInput == compactAbi1Input ? _boundStaticDrawGateRevision : null) ??
+            NeowFamilyGpuExecutor.RequestedStaticDrawGateRevision);
+        if (!compactAbi1Input && _composite is null && _transformations is null)
+        {
+            string? internalOrderRevision = _gpu is not null ? _gpu.InternalFilterOrderRevisionFor(false) :
+                _boundInternalFilterOrderObserved && !_boundSharedPrefixHashCompactInput ? _boundInternalFilterOrderRevision :
+                NeowFamilyGpuExecutor.RequestedInternalFilterOrderRevisionFor(_gpuPlan, false);
+            if (internalOrderRevision is not null) revision += "." + internalOrderRevision;
+        }
+        if (!compactAbi1Input && _composite is null && _transformations is null)
+        {
+            string? groupOutputRevision = _gpu is not null && _gpu.GroupOutputObservedFor(false)
+                ? _gpu.GroupOutputRevisionFor(false)
+                : _boundGroupOutputObserved && !_boundSharedPrefixHashCompactInput ? _boundGroupOutputRevision
+                : NeowFamilyGpuExecutor.RequestedGroupOutputRevisionFor(_gpuPlan, false, _requestGroupOutput);
+            if (groupOutputRevision is not null) revision += "." + groupOutputRevision;
+        }
+        if (_composite is null && _transformations is null)
+        {
+            string? structuralRevision = _gpu is not null && _gpu.StructuralObservedFor(compactAbi1Input)
+                ? _gpu.StructuralRevisionFor(compactAbi1Input)
+                : _boundStructuralObserved && _boundSharedPrefixHashCompactInput == compactAbi1Input
+                    ? _boundStructuralRevision
+                    : NeowFamilyGpuExecutor.RequestedStructuralRevisionFor(_gpuPlan, compactAbi1Input, _structuralTrials);
+            if (structuralRevision is not null) revision += "." + structuralRevision;
+        }
         return new(FamilyId, revision, "N.Neutral.20260905.v1", 1, "NoAcceptedWithinPathCurve");
     }
     public FamilyPerformanceObservation CapturePerformanceObservation() => _gpuPlan is null ? _physical.Observation() :
@@ -154,9 +271,14 @@ internal sealed partial class NeowFamily : IFamilyInvocation
         try
         {
             if (_gpu is null) _gpu = await executionContext.ExecuteGpuAsync(rd => new NeowFamilyGpuExecutor(rd, _gpuPlan,
-                (uint)RolltheSpire2.Core.Seed.XxHash64.HashUtf8(_request.SnapshotFingerprint, 0), _composite), cancellationToken).ConfigureAwait(false);
+                (uint)RolltheSpire2.Core.Seed.XxHash64.HashUtf8(_request.SnapshotFingerprint, 0), _composite,
+                useGroupOutput: _requestGroupOutput, structuralTrials: _structuralTrials), cancellationToken).ConfigureAwait(false);
             var result = await executionContext.ExecuteGpuAsync(_ => {
-                var survivors = _gpu.Execute(input, cancellationToken, out var metrics); return (survivors, metrics);
+                NeowFamilyGpuMetrics metrics;
+                var survivors = SupportsDenseWindowBatching && input.IsDense && input.Count > NeowFamilyGpuExecutor.Capacity
+                    ? _gpu.ExecuteDenseWindows(input, cancellationToken, out metrics)
+                    : _gpu.Execute(input, cancellationToken, out metrics);
+                return (survivors, metrics);
             }, cancellationToken).ConfigureAwait(false);
             if (!_parity)
             {
@@ -175,7 +297,7 @@ internal sealed partial class NeowFamily : IFamilyInvocation
             _bonesEntryPass += result.metrics.CurseSurvivors; _bonesPairPass += result.metrics.PairSurvivors;
             _uploadMs += result.metrics.UploadMs; _dispatchMs += result.metrics.DispatchSyncMs;
             _readbackMs += result.metrics.ReadbackMs; _canonicalizeMs += result.metrics.CanonicalizeMs;
-            if (input.Count == NeowFamilyGpuExecutor.Capacity)
+            if (input.Count == (_compact ? NeowFamilyGpuExecutor.Capacity : PreferredDenseWindowSize))
             {
                 _fullBatchInputs += input.Count; _fullBatchOutputs += result.survivors.Count;
                 _fullBatchDispatchMs += result.metrics.DispatchSyncMs; _fullBatchCanonicalMs += result.metrics.CanonicalMs;
@@ -192,7 +314,7 @@ internal sealed partial class NeowFamily : IFamilyInvocation
             if (_batches > 1)
             {
                 Interlocked.Add(ref _liveInputs, input.Count); _liveMs += result.metrics.CanonicalMs;
-                if (input.Count >= (_compact ? NeowFamilyGpuExecutor.Capacity / 4 : NeowFamilyGpuExecutor.Capacity))
+                if (input.Count >= (_compact ? NeowFamilyGpuExecutor.Capacity / 4 : PreferredDenseWindowSize))
                 { _steady++; _peak = Math.Max(_peak, input.Count * 1000d / result.metrics.CanonicalMs); }
             }
             if (RolltheSpire2.Bootstrap.RuntimeLog.DetailEnabled)

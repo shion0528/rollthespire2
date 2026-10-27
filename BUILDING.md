@@ -1,27 +1,17 @@
-# Build from source / 从源码构建
+# 构建resource.17
 
-Requires Windows, .NET 9 SDK (or a compatible newer SDK), and a local Slay the Spire 2 0.111.0 installation. The project targets .NET 9 and uses Godot.NET.Sdk 4.5.1, restored through NuGet. Game assemblies are not distributed here.
+需要.NET 9 SDK、项目指定的Godot.NET.Sdk 4.5.1，以及合法安装的游戏程序集。运行Mod时沿用游戏自带运行环境；SDK仅用于源码构建。
 
-需要 Windows、.NET 9 SDK（或兼容的新版本 SDK）及本地游戏 0.111.0。依赖由 NuGet 还原；游戏程序集需由自己的游戏安装提供。
+Windows上项目会尝试从Steam注册表定位游戏。也可以通过本机 `local.props` 设置 `Sts2Path` / `Sts2ReferenceDir`；不要提交该私人配置。
 
-Run from this directory, with game deployment disabled:
-
-```powershell
-dotnet build -c Release -p:Rt2ModsDir= -m:1
-```
-
-The project discovers the installed game automatically. If discovery fails, specify the directory containing `sts2.dll` and `0Harmony.dll`:
+在仓库根目录执行：
 
 ```powershell
-dotnet build -c Release -p:Rt2ModsDir= -m:1 "-p:Sts2ReferenceDir=D:\path\to\data_sts2_windows_x86_64"
+dotnet build RolltheSpire2.csproj -c Release -p:EnableGpuProfiling=false -p:Rt2ModsDir=
 ```
 
-Output: `.godot/mono/temp/bin/Release/RolltheSpire2.dll`. Copy that DLL and the root `RolltheSpire2.json` into `<game>/mods/RolltheSpire2/`. No PCK is required. Do not redistribute the game DLLs or copy them into the mod package.
+`Rt2ModsDir`留空用于构建而不自动部署；正式发布保持 `EnableGpuProfiling=false`。默认输出位于 `.godot/mono/temp/bin/Release/`，分发所需文件只有生成的DLL与根目录JSON manifest。不要分发游戏DLL、Godot缓存、调试文件或本地状态。
 
-输出 DLL 与根目录的 `RolltheSpire2.json` 一起放入游戏的 `mods/RolltheSpire2/`。不需要 PCK，也不要将游戏 DLL 放入安装包。
+原正式二进制使用既有构建环境生成；不同SDK、依赖或构建路径的重建产物不保证字节一致。本次整理核对的是生产源码字节与稳定17冻结快照一致，并未重新构建或改变正式DLL。
 
-Without `-p:Rt2ModsDir=`, the existing build can automatically deploy to the discovered game mod directory. Keep this option for verification builds. A successful build does not establish in-game compatibility with newer game versions.
-
-省略 `-p:Rt2ModsDir=` 时，构建可能自动部署到游戏目录。仅验证编译时请保留该参数。编译成功不代表已经通过游戏运行验证。
-
-This public snapshot includes production source and embedded runtime resources. Private development history, internal research, raw experiments and test tools are not part of this distribution. Embedded encyclopedia/developer-note texts and map probability tables, where present, are runtime resources and must be retained.
+tests中部分历史验证入口依赖原实验夹具，不能仅凭源码目录宣称全部测试可以一键复现。随附公开测速输入和逐轮计数用于核对记录及自行设计同条件复测。

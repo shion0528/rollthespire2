@@ -22,10 +22,13 @@ internal sealed partial class MerchantShopColorlessFamily : IFamilyInvocation
     private const int PerformanceSamplePeriod = 256;
     private const int InitialPerformanceSampleCount = 3;
     private readonly ExactSearchExecutionRequest _plan;
+    private readonly FamilyHeaderTransportPerformance _headerTransport;
     private readonly IRuntimeProfile _profile;
     private readonly FamilyAnalyticalCostProjection _analyticalCost;
     private readonly FamilySurvivalProjection _survival;
     private readonly FamilyExpectedFilteringCostProjection _expectedFilteringCost;
+    private readonly FamilyExpectedFilteringCostProjection _gpuExpectedFilteringCost;
+    private readonly MerchantOrderedSequenceSlotsPlan _orderedSequenceSlots;
     private readonly FamilyConditionPerformanceProjection _denseConditionPerformance;
     private readonly FamilyConditionPerformanceProjection _compactConditionPerformance;
     private readonly MerchantShopColorlessCompactionDecision _compactionDecision;
@@ -68,37 +71,52 @@ internal sealed partial class MerchantShopColorlessFamily : IFamilyInvocation
 
     private MerchantShopColorlessFamily(ExactSearchExecutionRequest plan, IRuntimeProfile profile)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(plan.RunOptions.Optimizations);
+        _headerTransport = new(plan.RunOptions.Optimizations);
         _plan = plan;
         _profile = profile;
+        _orderedSequenceSlots = MerchantShopColorlessOrderedSequencePolicy.Compile(plan);
         _analyticalCost = MerchantShopColorlessAnalyticalCost.Project(plan.Evaluation);
         _survival = MerchantShopColorlessSurvival.Project(plan);
         _compactionDecision = MerchantShopColorlessCompactionPolicy.Select(_survival);
         _expectedFilteringCost = MerchantShopColorlessExpectedFilteringCost.Project(
             plan, _analyticalCost, _survival);
+        _gpuExpectedFilteringCost = !_orderedSequenceSlots.Applied ? _expectedFilteringCost :
+            MerchantShopColorlessExpectedFilteringCost.ProjectPhysical(plan, _orderedSequenceSlots.Evaluation,
+                MerchantShopColorlessAnalyticalCost.Project(_orderedSequenceSlots.Evaluation), _survival);
         string densePerformanceRevision = _compactionDecision.Path == MerchantShopColorlessCompactionPath.StableOrderedCompaction
             ? FamilyPhysicalImplementationRevisions.MerchantShopColorlessStableDensePerformance
             : FamilyPhysicalImplementationRevisions.MerchantShopColorlessAtomicDensePerformance;
+        string prefixRevision = SharedVisibleSeedGpuCache.RevisionSuffix;
         _denseConditionPerformance = MerchantShopColorlessConditionPerformance.Project(
-            plan.Evaluation, densePerformanceRevision);
+            _orderedSequenceSlots.Evaluation, densePerformanceRevision + prefixRevision + _orderedSequenceSlots.RevisionSuffix);
         _compactConditionPerformance = MerchantShopColorlessConditionPerformance.Project(
-            plan.Evaluation, FamilyPhysicalImplementationRevisions.MerchantShopColorlessCompactPerformance);
+            _orderedSequenceSlots.Evaluation, FamilyPhysicalImplementationRevisions.MerchantShopColorlessCompactPerformance +
+                prefixRevision + _orderedSequenceSlots.RevisionSuffix);
     }
 
     public string FamilyId => "S.MerchantShopColorless";
-    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest request) =>
-        MerchantShopColorlessPhysicalPricing.Quote(_plan, _compactionDecision, request, _expectedFilteringCost);
+    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest request)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_plan.RunOptions.Optimizations);
+        return MerchantShopColorlessPhysicalPricing.Quote(_plan, _compactionDecision, request,
+            _gpuExpectedFilteringCost, _orderedSequenceSlots);
+    }
     bool IFamilyInvocation.CanBindPrivateSerial => !_gpuDisabled;
     FamilyPrivateGpuExecution IFamilyInvocation.BindPrivateSerial(Godot.RenderingDevice rd,
         PrivateOrdinalBuffer? input, PrivateOrdinalBuffer? output)
     {
         if (_gpuDisabled) throw new InvalidOperationException("S.PrivateSerialFaulted");
         var path = input is null && output is null ? _compactionDecision.Path : MerchantShopColorlessCompactionPath.AtomicAppendHostSort;
-        var gpu = MerchantShopColorlessGpuExecutor.Create(rd, _plan, path, input, output);
+        var gpu = MerchantShopColorlessGpuExecutor.Create(rd, _plan, path, input, output,
+            useOrderedSequenceSlots: _orderedSequenceSlots.Requested);
+        _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
         return new(gpu, gpu.DeviceName, gpu.SetupMs, input, output, (batch, count, token) =>
         {
             FamilyCandidateSet? result = null; MerchantShopColorlessGpuBatchMetrics m;
             if (output is not null) gpu.ExecutePrivateStage(batch, count, token, out m);
             else result = input is null ? gpu.Execute(FamilyCandidateSet.Dense(batch), token, out m) : gpu.ExecutePrivate(batch, count, token, out m);
+            _headerTransport.RevisionFor(gpu.HeaderReadbackRevision);
             return new(m.Survivors, result, m.CommandMs + m.SubmitMs + m.SyncMs,
                 m.ReadbackMs, m.ReadbackBytes, m.CanonicalAbi1ReadyMs,
                 m.Dispatches);
@@ -107,9 +125,10 @@ internal sealed partial class MerchantShopColorlessFamily : IFamilyInvocation
     public FamilyAnalyticalCostProjection AnalyticalCost => _analyticalCost;
     public FamilySurvivalProjection Survival => _survival;
     public FamilyExpectedFilteringCostProjection ExpectedFilteringCost => _expectedFilteringCost;
-    public FamilyConditionPerformanceProjection ConditionPerformance => _denseConditionPerformance;
+    public FamilyConditionPerformanceProjection ConditionPerformance => ResolveConditionPerformance(false);
     public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compactAbi1Input) =>
-        compactAbi1Input ? _compactConditionPerformance : _denseConditionPerformance;
+        _headerTransport.Apply(compactAbi1Input ? _compactConditionPerformance : _denseConditionPerformance,
+            _gpu?.HeaderReadbackRevision);
     internal int PreferredExecutionWindowSize => MerchantShopColorlessGpuExecutor.Capacity;
 
     public static bool TryCreate(
@@ -340,7 +359,7 @@ internal sealed partial class MerchantShopColorlessFamily : IFamilyInvocation
             $"compactionPath={_compactionDecision.Path};compactionPolicyMode={_compactionDecision.Mode};" +
             $"analyticalFinalSurvival={Maybe(_compactionDecision.AnalyticalFinalSurvival)};" +
             $"stableThreshold={F(_compactionDecision.StableThreshold)};compactionSelectionReason={_compactionDecision.Reason};" +
-            $"physicalImplementationRevision={_compactionDecision.PhysicalImplementationRevision};" +
+            $"physicalImplementationRevision={_compactionDecision.PhysicalImplementationRevision + _orderedSequenceSlots.RevisionSuffix};" +
             $"performanceDenseRevision={_denseConditionPerformance.PhysicalImplementationRevision};" +
             $"performanceCompactRevision={_compactConditionPerformance.PhysicalImplementationRevision};" +
             $"performanceTimingBoundary=CanonicalAbi1Ready;observedInputMode={(_observedCompactAbi1Input == true ? "CompactAbi1" : "Dense")};" +
@@ -350,6 +369,10 @@ internal sealed partial class MerchantShopColorlessFamily : IFamilyInvocation
             $"predicateCount={PredicateCount};maximumMerchantOrdinal={MaximumMerchantOrdinal};" +
             $"slotPredicateCount={_plan.Evaluation.MerchantColorlessConditions.Count};" +
             $"sequencePredicateCount={_plan.Evaluation.MerchantColorlessSequenceConditions.Count};" +
+            $"orderedSequenceSlots={_orderedSequenceSlots.Applied};orderedSequenceSlotsRevision={_orderedSequenceSlots.RevisionSuffix};" +
+            $"packedSlotPredicateCount={_orderedSequenceSlots.Evaluation.MerchantColorlessConditions.Count};" +
+            $"packedSequencePredicateCount={_orderedSequenceSlots.Evaluation.MerchantColorlessSequenceConditions.Count};" +
+            $"packedMaximumMerchantOrdinal={_orderedSequenceSlots.PackedMaximumOrdinal};" +
             $"gpuInputCandidates={_gpuInputCandidates};gpuProcessedCandidates={_gpuProcessedCandidates};" +
             $"gpuSurvivors={_gpuSurvivors};gpuBatches={_gpuBatches};" +
             $"liveEtaSteadyBatches={_liveSteadyBatches};durableComparableSteadyBatches={_comparableSteadyBatches};" +
@@ -404,7 +427,8 @@ internal sealed partial class MerchantShopColorlessFamily : IFamilyInvocation
     {
         if (_gpu is not null) return;
         _gpu = await executionContext.ExecuteGpuAsync(
-            rd => MerchantShopColorlessGpuExecutor.Create(rd, _plan, _compactionDecision.Path),
+            rd => MerchantShopColorlessGpuExecutor.Create(rd, _plan, _compactionDecision.Path,
+                useOrderedSequenceSlots: _orderedSequenceSlots.Requested),
             cancellationToken).ConfigureAwait(false);
         _setupMs = _gpu.SetupMs;
         _deviceName = _gpu.DeviceName;

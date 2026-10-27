@@ -8,6 +8,18 @@
 #define N_AUTHORED_UPGRADES __RT2_AUTHORED_UPGRADES__
 #define N_LOCAL_RESULTS __RT2_LOCAL_RESULTS__
 #define N_TRANSFORM_META_OFFSET __RT2_N_TRANSFORM_META_OFFSET__
+#ifndef RT2_N_GROUP_OUTPUT
+#define RT2_N_GROUP_OUTPUT 0
+#endif
+#ifndef N_INTERNAL_ORDER
+#define N_INTERNAL_ORDER 0
+#endif
+#ifndef RT2_LEAFY_GATE_LEGACY
+#define RT2_LEAFY_GATE_LEGACY 0
+#endif
+#ifndef RT2_PREFIX_HASH_CACHE
+#define RT2_PREFIX_HASH_CACHE 0
+#endif
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float64 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -26,10 +38,15 @@ layout(set=0,binding=10,std430) readonly restrict buffer Input { uint values[]; 
 layout(set=0,binding=11,std430) restrict buffer CurseSurvivors { uint values[]; } curse_survivors;
 layout(set=0,binding=12,std430) restrict buffer PairSurvivors { uint values[]; } pair_survivors;
 #endif
+#if RT2_PREFIX_HASH_CACHE && N_STAGE == 0
+layout(set=0,binding=13,std430) readonly restrict buffer PrefixHashTable { uint values[]; } prefix_hash_cache;
+uint prefix_hash_cache_value(uint i) { return prefix_hash_cache.values[i]; }
+#endif
 uint plan_value(uint i) { return plan_meta.values[i]; }
 uint64_t plan_u64(uint i) { return uint64_t(plan_value(i)) | (uint64_t(plan_value(i+1u)) << 32u); }
 
 /*__RT2_NEOW_LOCAL_DONOR__*/
+/*__RT2_N_INTERNAL_FILTER_ORDER__*/
 /*__RT2_N_JOINT_TRANSFORMS__*/
 /*__RT2_CAPSULE_COMPOSITE__*/
 
@@ -80,6 +97,48 @@ bool local_operator(uint source, inout RouteRngState state) {
     if (source == 22u) return execute_scroll_boxes_route(count,t0,t1,t2,flags & 0x7fffffffu,predicate,state);
     return true;
 }
+#if N_LEAFY_PRE_GATE
+// This Boolean pre-gate owns no continuation state. The real route still uses
+// rng_initialize/execute_leafy_route, including both complete state transitions.
+uint64_t leafy_pre_gate_first_draw(uint64_t seed, out uint64_t initial_s1) {
+    // SplitMix's second output is the initial Xoshiro s1. No other initial
+    // word contributes to Xoshiro256**'s first output.
+    uint64_t state = seed + make_u64(0x7f4a7c15u, 0x9e3779b9u);
+    initial_s1 = splitmix_next(state);
+    return rotl64(initial_s1 * uint64_t(5u), 7u) * uint64_t(9u);
+}
+uint64_t leafy_pre_gate_second_draw(uint64_t seed, uint64_t initial_s1) {
+    uint64_t state = seed;
+    uint64_t initial_s0 = splitmix_next(state);
+    state += make_u64(0x7f4a7c15u, 0x9e3779b9u);
+    uint64_t initial_s2 = splitmix_next(state);
+    // After the first next_u64, s1 is old_s1 ^ old_s2 ^ old_s0.
+    // Initial s3 cannot influence either of the first two output words.
+    uint64_t second_s1 = initial_s1 ^ initial_s2 ^ initial_s0;
+    return rotl64(second_s1 * uint64_t(5u), 7u) * uint64_t(9u);
+}
+bool leafy_pre_gate_matches(uint64_t seed, uint target_count, uint target0, uint target1) {
+#if !RT2_LEAFY_GATE_LEGACY
+    // Admission currently proves exactly two targets. Preserve the canonical
+    // behavior for other counts as well, without extending this optimization.
+    if (target_count == 2u) {
+        uint strike_length = plan_value(58u), defend_length = plan_value(59u);
+        if (strike_length == 0u || defend_length == 0u) return false;
+        uint64_t initial_s1;
+        uint64_t first_draw = leafy_pre_gate_first_draw(seed, initial_s1);
+        uint first = leafy_strike.ids[next_int_current_shortcut_from_mantissa(first_draw >> 11u, strike_length)];
+        if (first != target0 && first != target1) return false;
+        uint64_t second_draw = leafy_pre_gate_second_draw(seed, initial_s1);
+        uint second = leafy_defend.ids[next_int_current_shortcut_from_mantissa(second_draw >> 11u, defend_length)];
+        return (first == target0 && second == target1) ||
+               (first == target1 && second == target0);
+    }
+#endif
+    RouteRngState state;
+    state.transformations = rng_initialize(seed);
+    return execute_leafy_route(target_count, target0, target1, true, state);
+}
+#endif
 #if N_LEAFY_PRE_GATE || N_TRANSFORM_META_OFFSET >= 0
 bool leafy_pre_gate(uint64_t root) {
 #if N_TRANSFORM_META_OFFSET >= 0
@@ -87,9 +146,8 @@ bool leafy_pre_gate(uint64_t root) {
 #endif
 #if N_LEAFY_PRE_GATE
     uint o = 4u * 5u;
-    RouteRngState state;
-    state.transformations = rng_initialize(root + plan_u64(37u));
-    return execute_leafy_route(conditions.values[o],conditions.values[o+1u],conditions.values[o+2u],true,state);
+    return leafy_pre_gate_matches(root + plan_u64(37u),
+        conditions.values[o],conditions.values[o+1u],conditions.values[o+2u]);
 #else
     return true;
 #endif
@@ -322,6 +380,66 @@ bool matches(uint64_t root) {
     uint a,b;
     return pair_identity(rewards,a,b) && local_matches(root,rewards,a,b);
 }
+// Each 64-thread workgroup consumes at most 8 roots per thread. All lanes,
+// including empty/tail/error lanes, rendezvous before the cooperative flush.
+// Keeping only survivor payloads in shared memory avoids 8 live root registers
+// per thread. Stage 1/2 retain their sparse append to avoid empty-group barriers.
+#if RT2_N_GROUP_OUTPUT && (N_STAGE == 0 || N_STAGE == 4)
+shared uint rt2_group_count;
+shared uint rt2_group_base;
+shared uint rt2_group_payload[1536];
+void rt2_group_begin() {
+    if(gl_LocalInvocationID.x==0u) rt2_group_count=0u;
+    barrier();
+}
+void rt2_group_add(uint ordinal, uint64_t root) {
+    uint slot=atomicAdd(rt2_group_count,1u);
+    uint dst=slot*3u;
+    rt2_group_payload[dst]=ordinal;
+    rt2_group_payload[dst+1u]=uint(root);
+    rt2_group_payload[dst+2u]=uint(root>>32u);
+}
+void rt2_group_flush() {
+    barrier();
+#if N_STAGE == 0
+    uint capacity=batch.values[6u];
+#else
+    uint capacity=min(batch.values[6u],batch.values[5u]>0u ? (batch.values[5u]-1u)/3u : 0u);
+#endif
+    if(gl_LocalInvocationID.x==0u) {
+        uint count=rt2_group_count;
+        rt2_group_base=0u;
+        if(count!=0u) {
+#if N_STAGE == 0
+            rt2_group_base=atomicAdd(header.values[6u],count);
+#else
+            rt2_group_base=atomicAdd(output_ordinals.values[0u],count);
+#endif
+            // The production capacities and at most 512 additions per group
+            // keep this addition below uint overflow. Keep the old error ABI.
+            if(rt2_group_base>capacity || count>capacity-rt2_group_base)
+                atomicExchange(header.values[3u],1u);
+        }
+    }
+    barrier();
+    for(uint i=gl_LocalInvocationID.x;i<rt2_group_count;i+=64u) {
+        uint slot=rt2_group_base+i;
+        if(slot>=capacity) continue;
+        uint src=i*3u;
+#if N_STAGE == 0
+        uint dst=slot*3u;
+        curse_survivors.values[dst]=rt2_group_payload[src];
+        curse_survivors.values[dst+1u]=rt2_group_payload[src+1u];
+        curse_survivors.values[dst+2u]=rt2_group_payload[src+2u];
+#else
+        uint dst=1u+slot*3u;
+        output_ordinals.values[dst]=rt2_group_payload[src];
+        output_ordinals.values[dst+1u]=rt2_group_payload[src+1u];
+        output_ordinals.values[dst+2u]=rt2_group_payload[src+2u];
+#endif
+    }
+}
+#endif
 void append_ordinal(uint ordinal) {
 #if BONES_K_MODE == 1
     ordinal |= bones_k_route_mask << 24u;
@@ -330,16 +448,62 @@ void append_ordinal(uint ordinal) {
     if(slot<batch.values[5u]) output_ordinals.values[slot]=ordinal;
     else atomicExchange(header.values[3u],1u);
 }
-#if N_STAGE == 1 || N_STAGE == 2
+#if N_STAGE == 4
 void main() {
+#if RT2_N_GROUP_OUTPUT
+    rt2_group_begin();
+    bool input_valid=header.values[3u]==0u;
+#else
     if (header.values[3u]!=0u) return;
+#endif
     uint first=gl_GlobalInvocationID.x*8u;
-    uint count=min(header.values[N_STAGE==1 ? 6u : 7u],batch.values[N_STAGE==1 ? 6u : 7u]);
-    for (uint lane=0u;lane<8u && first+lane<count;lane++) {
-#if N_STAGE == 1
+    uint count=min(header.values[6u],batch.values[6u]);
+#if RT2_N_GROUP_OUTPUT
+    for(uint lane=0u;lane<8u && first+lane<count && input_valid;lane++) {
+#else
+    for(uint lane=0u;lane<8u && first+lane<count;lane++) {
+#endif
         uint src=(first+lane)*3u;
         uint ordinal=curse_survivors.values[src];
         uint64_t root=make_u64(curse_survivors.values[src+1u],curse_survivors.values[src+2u]);
+        if(!internal_final_curse_gate(root)) continue;
+#if RT2_N_GROUP_OUTPUT
+        rt2_group_add(ordinal,root);
+#else
+        uint slot=atomicAdd(output_ordinals.values[0u],1u);
+        if(slot>=batch.values[6u] || slot>=(batch.values[5u]-1u)/3u) {
+            atomicExchange(header.values[3u],1u); continue;
+        }
+        uint dst=1u+slot*3u;
+        output_ordinals.values[dst]=ordinal;
+        output_ordinals.values[dst+1u]=uint(root);
+        output_ordinals.values[dst+2u]=uint(root>>32u);
+#endif
+    }
+#if RT2_N_GROUP_OUTPUT
+    rt2_group_flush();
+#endif
+}
+#elif N_STAGE == 1 || N_STAGE == 2
+void main() {
+    if (header.values[3u]!=0u) return;
+    uint first=gl_GlobalInvocationID.x*8u;
+#if N_STAGE == 1 && N_INTERNAL_ORDER
+    uint count=min(output_ordinals.values[0u],batch.values[6u]);
+#else
+    uint count=min(header.values[N_STAGE==1 ? 6u : 7u],batch.values[N_STAGE==1 ? 6u : 7u]);
+#endif
+    for (uint lane=0u;lane<8u && first+lane<count;lane++) {
+#if N_STAGE == 1
+#if N_INTERNAL_ORDER
+        uint src=1u+(first+lane)*3u;
+        uint ordinal=output_ordinals.values[src];
+        uint64_t root=make_u64(output_ordinals.values[src+1u],output_ordinals.values[src+2u]);
+#else
+        uint src=(first+lane)*3u;
+        uint ordinal=curse_survivors.values[src];
+        uint64_t root=make_u64(curse_survivors.values[src+1u],curse_survivors.values[src+2u]);
+#endif
         RngState rewards=rng_initialize(root+plan_u64(33u));
         uint a,b;
         if (!pair_identity(rewards,a,b)) continue;
@@ -368,16 +532,42 @@ void main() {
 }
 #else
 void main() {
+#if RT2_N_GROUP_OUTPUT && N_STAGE == 0
+    rt2_group_begin();
+    bool hash_valid=true;
+#endif
     uint first=gl_GlobalInvocationID.x*8u;
     uint count=batch.values[3u];
     uint64_t base=uint64_t(batch.values[0u])|(uint64_t(batch.values[1u])<<32u);
     uint64_t seed_first8; uint tail;
+#if RT2_PREFIX_HASH_CACHE && N_STAGE == 0
+    uint prefix_row, suffix_ordinal;
+    uint64_t prefix_hash;
+    if(batch.values[4u]==0u && first<count &&
+        !prefix_hash_cache_initialize(first,prefix_row,suffix_ordinal,tail,prefix_hash)) {
+        atomicExchange(header.values[3u],1u);
+#if RT2_N_GROUP_OUTPUT && N_STAGE == 0
+        hash_valid=false;
+#else
+        return;
+#endif
+    }
+#else
     if (batch.values[4u]==0u && first<count) encode_seed12_packed(base+uint64_t(first),seed_first8,tail);
+#endif
     // Donor dispatch accounting: no globally contended atomic per eight roots.
     if (first==0u) header.values[4u]=count;
+#if RT2_N_GROUP_OUTPUT && N_STAGE == 0
+    for (uint lane=0u;lane<8u && first+lane<count && hash_valid;lane++) {
+#else
     for (uint lane=0u;lane<8u && first+lane<count;lane++) {
+#endif
         uint ordinal=batch.values[4u]==0u ? first+lane : input_ordinals.values[first+lane];
+#if RT2_PREFIX_HASH_CACHE && N_STAGE == 0
+        uint64_t root=batch.values[4u]==0u ? xxhash64_seed12_from_prefix(prefix_hash,tail) : root_hash_for_ordinal(base+uint64_t(ordinal));
+#else
         uint64_t root=batch.values[4u]==0u ? xxhash64_seed12_packed(seed_first8,tail) : root_hash_for_ordinal(base+uint64_t(ordinal));
+#endif
 #if N_STAGE == 0
         RngState event_rng; uint curse_ordinal,curse;
 #if N_LEAFY_PRE_GATE || N_TRANSFORM_META_OFFSET >= 0
@@ -385,17 +575,38 @@ void main() {
 #else
         if (draw_neow_curse(root,event_rng,curse_ordinal,curse) && (plan_value(69u)&(1u<<curse_ordinal))==0u) {
 #endif
+#if RT2_N_GROUP_OUTPUT
+            rt2_group_add(ordinal,root);
+#else
             uint slot=atomicAdd(header.values[6u],1u);
             if(slot<batch.values[6u]) {
                 uint dst=slot*3u;
                 curse_survivors.values[dst]=ordinal;
                 curse_survivors.values[dst+1u]=uint(root); curse_survivors.values[dst+2u]=uint(root>>32u);
             } else atomicExchange(header.values[3u],1u);
+#endif
         }
 #else
         if (matches(root)) append_ordinal(ordinal);
 #endif
-        if(batch.values[4u]==0u && lane<7u) advance_seed12_packed(seed_first8,tail);
+        if(batch.values[4u]==0u && lane<7u) {
+#if RT2_PREFIX_HASH_CACHE && N_STAGE == 0
+            if(first+lane+1u<count && !prefix_hash_cache_advance(prefix_row,suffix_ordinal,tail,prefix_hash)) {
+                atomicExchange(header.values[3u],1u);
+#if RT2_N_GROUP_OUTPUT && N_STAGE == 0
+                hash_valid=false;
+                break;
+#else
+                return;
+#endif
+            }
+#else
+            advance_seed12_packed(seed_first8,tail);
+#endif
+        }
     }
+#if RT2_N_GROUP_OUTPUT && N_STAGE == 0
+    rt2_group_flush();
+#endif
 }
 #endif

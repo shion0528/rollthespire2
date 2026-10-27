@@ -79,6 +79,40 @@ internal sealed partial class SearchWorkspacePersistence
     internal static int ResolveSearchWorkers(int? savedBudget, int logicalProcessors) =>
         Math.Clamp(savedBudget ?? Math.Max(1, logicalProcessors / 2), 1, 64);
 
+    internal static SearchResourceBudget ResolveSearchResources(int? cpuLoadPercent, int gpuLoadPercent,
+        int? savedWorkerBudget, int logicalProcessors)
+    {
+        int cpu = cpuLoadPercent ?? (savedWorkerBudget is { } legacy
+            ? (int)Math.Clamp((long)Math.Clamp(legacy, 1, 64) * 100 / Math.Max(1, logicalProcessors), 1L, 100L)
+            : 50);
+        return new SearchResourceBudget(cpu, gpuLoadPercent).Normalize();
+    }
+
+    internal SearchResourceBudget SearchResources => ResolveSearchResources(_preferences.CpuLoadPercent,
+        _preferences.GpuLoadPercent, _preferences.SearchWorkerBudget, System.Environment.ProcessorCount);
+
+    internal SearchOptimizationSettings SearchOptimizations =>
+        _preferences.Optimizations ?? SearchOptimizationSettings.AllEnabled;
+
+    internal void SetSearchOptimizations(SearchOptimizationSettings optimizations)
+    {
+        ArgumentNullException.ThrowIfNull(optimizations);
+        if (HasSearchInFlight) return;
+        _preferences.Optimizations = optimizations;
+        MarkPreferencesDirty();
+        FlushPreferences();
+    }
+
+    internal void SetSearchResources(SearchResourceBudget resources)
+    {
+        if (HasSearchInFlight) return;
+        var normalized = resources.Normalize();
+        _preferences.CpuLoadPercent = normalized.CpuPercent;
+        _preferences.GpuLoadPercent = normalized.GpuPercent;
+        MarkPreferencesDirty();
+        FlushPreferences();
+    }
+
     public void SetSkipExactValidation(bool enabled)
     {
         _preferences.SkipExactValidation = enabled;
@@ -209,14 +243,15 @@ internal sealed partial class SearchWorkspacePersistence
     public void ApplyPreferencesToRuntimeSettings(RuntimePredictionSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings);
-        settings.RelicComputeBackendPreference = _preferences.SearchMode switch
+        settings.Resources = SearchResources;
+        settings.RelicComputeBackendPreference = settings.Resources.GpuPercent == 0
+            ? Beta110RelicComputeBackendPreference.Cpu : _preferences.SearchMode switch
         {
             "CPU" => Beta110RelicComputeBackendPreference.Cpu,
             _ => Beta110RelicComputeBackendPreference.Auto
         };
         settings.NormalizeWorkshopSearchModePreference();
-        if (_preferences.SearchWorkerBudget is >= 1 and <= 64)
-            settings.SearchWorkerCount = _preferences.SearchWorkerBudget.Value;
+        settings.SearchWorkerCount = settings.Resources.ResolveCpuWorkers(System.Environment.ProcessorCount);
     }
 
     public void CapturePreferences(string languageCode, Vector2 logicalSize, RuntimePredictionSettings settings)
@@ -224,14 +259,17 @@ internal sealed partial class SearchWorkspacePersistence
         ArgumentNullException.ThrowIfNull(settings);
         string normalizedLanguage = string.Equals(languageCode, "zh", StringComparison.OrdinalIgnoreCase) ? "zh" : "en";
         Beta110RelicComputeBackendPreference mode = settings.NormalizeWorkshopSearchModePreference();
-        string storedMode = mode == Beta110RelicComputeBackendPreference.Cpu ? "CPU" : "Auto";
+        string storedMode = settings.Resources.GpuPercent == 0 ? _preferences.SearchMode
+            : mode == Beta110RelicComputeBackendPreference.Cpu ? "CPU" : "Auto";
+        var resources = settings.Resources.Normalize();
         float width = Math.Max(0f, logicalSize.X);
         float height = Math.Max(0f, logicalSize.Y);
         if (string.Equals(_preferences.Language, normalizedLanguage, StringComparison.Ordinal) &&
             Math.Abs(_preferences.PanelWidth - width) < 0.5f &&
             Math.Abs(_preferences.PanelHeight - height) < 0.5f &&
             string.Equals(_preferences.SearchMode, storedMode, StringComparison.Ordinal) &&
-            _preferences.SearchWorkerBudget == settings.SearchWorkerCount)
+            _preferences.CpuLoadPercent == resources.CpuPercent &&
+            _preferences.GpuLoadPercent == resources.GpuPercent)
         {
             return;
         }
@@ -239,7 +277,8 @@ internal sealed partial class SearchWorkspacePersistence
         _preferences.PanelWidth = width;
         _preferences.PanelHeight = height;
         _preferences.SearchMode = storedMode;
-        _preferences.SearchWorkerBudget = settings.SearchWorkerCount;
+        _preferences.CpuLoadPercent = resources.CpuPercent;
+        _preferences.GpuLoadPercent = resources.GpuPercent;
         MarkPreferencesDirty();
     }
 
@@ -355,6 +394,17 @@ internal sealed partial class SearchWorkspacePersistence
     }
 
     public void AppendResult(SearchCandidate candidate, string queryFingerprint)
+        => RecordHistoryResult(CreatePersistedResult(candidate, queryFingerprint));
+
+    internal void AppendResults(IReadOnlyList<SearchCandidate> candidates, string queryFingerprint)
+    {
+        if (candidates.Count == 0) return;
+        var results = new PersistedSearchResult[candidates.Count];
+        for (int i = 0; i < candidates.Count; i++) results[i] = CreatePersistedResult(candidates[i], queryFingerprint);
+        RecordHistoryResults(results);
+    }
+
+    private PersistedSearchResult CreatePersistedResult(SearchCandidate candidate, string queryFingerprint)
     {
         ArgumentNullException.ThrowIfNull(candidate);
         SearchMatchWitness? routeWitness = candidate.PrimaryWitness is { OpeningRouteId.Length: > 0 } primaryRouteWitness
@@ -381,7 +431,7 @@ internal sealed partial class SearchWorkspacePersistence
                 RuntimeLog.Warn("savedSearchResultContextUnavailable=" + ex.Message);
             }
         }
-        RecordHistoryResult(result);
+        return result;
     }
 
     public IReadOnlyList<PersistedSearchResult> GetPersistedResults() => _workspace.Results.ToArray();
@@ -394,6 +444,7 @@ internal sealed partial class SearchWorkspacePersistence
     public bool TrySetPersistentOrigin(string rawSeed, out string canonicalSeed, out string issue)
     {
         canonicalSeed = string.Empty;
+        if (HasSearchInFlight) { issue = "PersistentOriginSearchInFlight"; return false; }
         if (!Beta110SeedCodec.TryParseOrdinal(rawSeed?.Trim() ?? string.Empty, out ulong ordinal, out canonicalSeed, out issue))
             return false;
         if (ordinal >= Beta110SeedCodec.SpaceSize)
@@ -407,6 +458,7 @@ internal sealed partial class SearchWorkspacePersistence
 
     public string RandomizePersistentOrigin()
     {
+        if (HasSearchInFlight) throw new InvalidOperationException("PersistentOriginSearchInFlight");
         ulong ordinal = RandomVisibleOrdinal();
         SetPersistentOriginOrdinal(ordinal, "SystemRandom");
         return Beta110SeedCodec.FormatOrdinal(ordinal);
@@ -419,13 +471,16 @@ internal sealed partial class SearchWorkspacePersistence
         if (_cursor.NextCursor == nextOrdinal)
             return;
         _cursor.NextCursor = nextOrdinal;
+        if (nextOrdinal != 0) _cursor.EndOfSpaceWrapCommitted = false;
         MarkCursorDirty();
     }
 
     public void CommitEndOfSpaceWrap()
     {
+        if (_cursor.EndOfSpaceWrapCommitted && _cursor.NextCursor == 0) return;
         _cursor.NextCursor = 0UL;
         _cursor.WrapCount++;
+        _cursor.EndOfSpaceWrapCommitted = true;
         MarkCursorDirty();
         RuntimeLog.Info($"persistentSearchCursorWrap=true;nextCursor=0;wrapCount={_cursor.WrapCount}");
     }
@@ -497,18 +552,28 @@ internal sealed partial class SearchWorkspacePersistence
     }
 
     public void FlushAll()
+        => TryFlushAll();
+
+    internal bool TryFlushAll()
     {
         FlushPreferences();
         FlushWorkspace();
         FlushPredictorContext();
         FlushCursor();
-        WriteNow("search_environment.json", _environment);
+        bool environmentSaved = WriteNow("search_environment.json", _environment);
+        return !_preferencesDirty && !_workspaceDirty && !_predictorContextDirty && !_cursorDirty && environmentSaved;
     }
 
     public string DescribeCursor() =>
         $"origin={CurrentPersistentOriginSeed};next={CurrentNextCursorSeed};wrapCount={_cursor.WrapCount}";
 
-    public void FlushCursor() => FlushDocument(ref _cursorDirty, ref _cursorDirtyAge, "search_cursor.json", _cursor);
+    public void FlushCursor()
+    {
+        // A durable resume cursor must never overtake unsaved result records.
+        if (_workspaceDirty) FlushWorkspace();
+        if (_workspaceDirty) return;
+        FlushDocument(ref _cursorDirty, ref _cursorDirtyAge, "search_cursor.json", _cursor);
+    }
     public void FlushWorkspace() => FlushDocument(ref _workspaceDirty, ref _workspaceDirtyAge, "search_workspace.json", _workspace);
     public void FlushPredictorContext() => FlushDocument(ref _predictorContextDirty, ref _predictorContextDirtyAge, "predictor_context.json", _predictorContext);
     public void FlushPreferences() => FlushDocument(ref _preferencesDirty, ref _preferencesDirtyAge, "user_preferences.json", _preferences);
@@ -518,6 +583,7 @@ internal sealed partial class SearchWorkspacePersistence
         _cursor.Initialized = true;
         _cursor.PersistentOrigin = ordinal;
         _cursor.NextCursor = ordinal;
+        ClearSearchCheckpointBinding();
         MarkCursorDirty();
         FlushCursor();
         RuntimeLog.Info(
@@ -534,19 +600,25 @@ internal sealed partial class SearchWorkspacePersistence
             Initialized = true,
             PersistentOrigin = ordinal,
             NextCursor = ordinal,
-            WrapCount = 0
+            WrapCount = 0,
+            CheckpointVersion = 1
         };
         MarkCursorDirty();
         FlushCursor();
-        RuntimeLog.Info($"persistentSearchCursorInitialized=true;origin={ordinal};seed={Beta110SeedCodec.FormatOrdinal(ordinal)};randomSource=SystemCryptographicRandom");
+        RuntimeLog.Info($"persistentSearchCursorInitialized=true;origin={ordinal};seed={Beta110SeedCodec.FormatOrdinal(ordinal)};randomSource=SystemCryptographicRandom;originPolicy=RandomPrefix8ZeroSuffix4;continuation=Sequential");
     }
 
     private static ulong RandomVisibleOrdinal()
     {
         Span<byte> bytes = stackalloc byte[sizeof(ulong)];
-        System.Security.Cryptography.RandomNumberGenerator.Fill(bytes);
-        ulong value = BitConverter.ToUInt64(bytes);
-        return value % Beta110SeedCodec.SpaceSize;
+        ulong value;
+        do
+        {
+            System.Security.Cryptography.RandomNumberGenerator.Fill(bytes);
+            value = BitConverter.ToUInt64(bytes);
+        }
+        while (value < VisibleSeedBlockPolicy.MinimumUnbiasedRandomValue);
+        return VisibleSeedBlockPolicy.RandomOriginFromValue(value);
     }
 
     private void NormalizeDocuments()
@@ -557,11 +629,21 @@ internal sealed partial class SearchWorkspacePersistence
         _preferences.SearchMode = string.Equals(_preferences.SearchMode, "CPU", StringComparison.OrdinalIgnoreCase) ? "CPU" : "Auto";
         _preferences.WorkbenchFlags ??= new();
         _preferences.ReadNotesVersions ??= new();
+        if (_preferences.Optimizations is null)
+        {
+            _preferences.Optimizations = SearchOptimizationSettings.AllEnabled;
+            MarkPreferencesDirty();
+        }
         // The old global button only acknowledged release notes, not positioning.
         if (!string.IsNullOrWhiteSpace(_preferences.ReadReleaseNotesVersion))
             _preferences.ReadNotesVersions.TryAdd("release", _preferences.ReadReleaseNotesVersion);
         if (_preferences.SearchWorkerBudget is { } budget)
             _preferences.SearchWorkerBudget = ResolveSearchWorkers(budget, System.Environment.ProcessorCount);
+        var resources = SearchResources;
+        if (_preferences.CpuLoadPercent != resources.CpuPercent || _preferences.GpuLoadPercent != resources.GpuPercent)
+            MarkPreferencesDirty();
+        _preferences.CpuLoadPercent = resources.CpuPercent;
+        _preferences.GpuLoadPercent = resources.GpuPercent;
         _preferences.LastPage = string.IsNullOrWhiteSpace(_preferences.LastPage)
             ? "Analysis"
             : _preferences.LastPage.Trim();
@@ -594,6 +676,8 @@ internal sealed partial class SearchWorkspacePersistence
             RuntimeLog.Info("searchWorkspaceCombatRewardDraftMigrated=true;legacyBattleBundleDropped=true");
         }
         _cursor.SchemaVersion = SchemaVersion;
+        _cursor.CheckpointQueryFingerprint ??= "";
+        _cursor.CheckpointEnvironmentFingerprint ??= "";
         _environment.SchemaVersion = SchemaVersion;
     }
 
@@ -739,6 +823,12 @@ internal sealed class UserPreferencesDocument
     public float PanelHeight { get; set; }
     public string SearchMode { get; set; } = "Auto";
     public int? SearchWorkerBudget { get; set; }
+    // Nullable so preferences from before resource budgets retain their explicit worker choice.
+    public int? CpuLoadPercent { get; set; }
+    public int GpuLoadPercent { get; set; } = 100;
+    // Missing, null and partially specified older preferences keep all options
+    // enabled by default. These are execution choices, never query semantics.
+    public SearchOptimizationSettings? Optimizations { get; set; } = SearchOptimizationSettings.AllEnabled;
     public int QueryHistoryLimit { get; set; } = 30;
     public bool ShowOfficialPresets { get; set; } = true;
     // Opt-in, including preferences saved before the in-run entry was introduced.
@@ -830,6 +920,10 @@ internal sealed class SearchCursorDocument
     public ulong PersistentOrigin { get; set; }
     public ulong NextCursor { get; set; }
     public long WrapCount { get; set; }
+    public int CheckpointVersion { get; set; }
+    public string CheckpointQueryFingerprint { get; set; } = "";
+    public string CheckpointEnvironmentFingerprint { get; set; } = "";
+    public bool EndOfSpaceWrapCommitted { get; set; }
 }
 
 internal sealed class SearchEnvironmentSignature

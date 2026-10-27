@@ -1,0 +1,21 @@
+<Project Sdk="Godot.NET.Sdk/4.5.1">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>ProductionSearchHost</AssemblyName>
+    <RootNamespace>GpuResourceSmoke</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableSharedPrefixTests Condition="'$(EnableSharedPrefixTests)' == ''">true</EnableSharedPrefixTests>
+    <DefineConstants Condition="'$(EnableSharedPrefixTests)' == 'true'">$(DefineConstants);RT2_SHARED_PREFIX_TESTS</DefineConstants>
+    <Rt2AssemblyPath Condition="'$(Rt2AssemblyPath)' == ''">../../.godot/mono/temp/bin/Debug/RolltheSpire2.dll</Rt2AssemblyPath>
+  </PropertyGroup>
+  <Import Project="../../Sts2PathDiscovery.props" />
+  <ItemGroup Condition="'$(EnableSharedPrefixTests)' != 'true'">
+    <Compile Remove="Shared*Checks.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <Reference Include="RolltheSpire2"><HintPath>$(Rt2AssemblyPath)</HintPath><Private>true</Private></Reference>
+    <Reference Include="sts2"><HintPath>$(Sts2ReferenceDir)/sts2.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(Sts2ReferenceDir)/0Harmony.dll</HintPath><Private>true</Private></Reference>
+  </ItemGroup>
+</Project>

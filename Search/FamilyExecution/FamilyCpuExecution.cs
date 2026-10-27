@@ -3,6 +3,7 @@ using RolltheSpire2.Bootstrap;
 using RolltheSpire2.Compatibility;
 using RolltheSpire2.Search.Contracts;
 using RolltheSpire2.Core.Seed;
+using RolltheSpire2.Search.Runtime;
 
 namespace RolltheSpire2.Search.FamilyExecution;
 
@@ -14,6 +15,9 @@ internal sealed class FamilyCpuExecution : IFamilyInvocation
     private readonly IFamilyInvocation? _owner;
     private readonly Func<ulong, bool>? _matches;
     private readonly Func<FamilyPhysicalQuoteRequest, FamilyPhysicalQuote?>? _quote;
+    private readonly CpuNeowBatchGate? _batchNeowGate;
+    private long _batchNeowBlocks, _batchNeowRejected;
+    internal long BatchNeowBlocks => Interlocked.Read(ref _batchNeowBlocks);
     private readonly CpuCostSnapshot _cost = CpuCostCalibration.Capture();
     private CpuLocalPeak? _localPeak;
     private bool _calibrationCoverageMatched;
@@ -26,20 +30,46 @@ internal sealed class FamilyCpuExecution : IFamilyInvocation
     private double _sampleMs;
     internal int Workers => _workers;
     internal IEnumerable<CpuLocalPeak> LocalPeaks => !_disabled && _localPeak is not null ? new[]{_localPeak} : [];
-    private FamilyPhysicalQuote? LocalQuote(FamilyPhysicalQuoteRequest g) => _quote?.Invoke(g) is {} raw
-        ? _cost.Local(raw,Condition(g.CompactInput).PhysicalImplementationRevision,_workers,g.CompactInput) : null;
+    private FamilyPhysicalQuote? LocalQuote(FamilyPhysicalQuoteRequest g)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        if (_quote?.Invoke(g) is not { } raw) return null;
+        // Legacy global CPU ratios include the old full-root hashing envelope.
+        // Keep them out of this distinct implementation until it has its own
+        // admitted reference/calibration shape. The unscaled reference carries
+        // no invented measured speedup for the new hash implementation.
+        if (_batchNeowGate is not null && !g.CompactInput) return raw with
+        {
+            LocalExecutorCostRatio = 1,
+            LocalCostSource = "ReferenceDefaultCpuBatchNeowRevision",
+            Evidence = raw.Evidence + ";ExecutionClass=CPU;BatchGate=" + CpuNeowBatchGate.Revision +
+                ";LegacyCpuCalibrationExcluded=true;sameRunFrozen=true"
+        };
+        if (_usePrefixCache) return raw with
+        {
+            LocalExecutorCostRatio = 1,
+            LocalCostSource = "ReferenceDefaultCpuPrefixRevision",
+            Evidence = raw.Evidence + ";ExecutionClass=CPU;RootHash=" + CpuPrefixRootHasher.Revision +
+                ";LegacyCpuCalibrationExcluded=true;sameRunFrozen=true"
+        };
+        return _cost.Local(raw,Condition(g.CompactInput).PhysicalImplementationRevision,_workers,g.CompactInput);
+    }
     internal int WindowCapacity => _windowCapacity;
     internal IReadOnlySet<string>? RequiredPassedCoverage { get; set; }
     internal FamilyPhysicalQuote? Quote(FamilyPhysicalQuoteRequest g, IReadOnlySet<string> passed) =>
         RequiredPassedCoverage is not null && !RequiredPassedCoverage.SetEquals(passed) ? null : LocalQuote(g);
     internal FamilyCpuExecution(ExactSearchExecutionRequest request, IFamilyInvocation owner,
         string revision, Func<ulong, bool> matches, int workers,
-        Func<FamilyPhysicalQuoteRequest, FamilyPhysicalQuote?> quote)
-        : this(request, owner.FamilyId, revision, workers, 65536, numericalRoots: request.ProfileId == RuntimeProfileId.Beta111)
+        Func<FamilyPhysicalQuoteRequest, FamilyPhysicalQuote?> quote, CpuNeowBatchGate? batchNeowGate = null)
+        : this(request, owner.FamilyId, revision, workers, 65536, numericalRoots: request.ProfileId == RuntimeProfileId.Beta111,
+            batchNeowGate: batchNeowGate)
     {
         if (owner.Coverage.Count != 1 || owner.Coverage[0] != owner.FamilyId)
             throw new ArgumentException("CPU realization requires one owning Family", nameof(owner));
-        _owner = owner; _matches = matches; _quote = quote;
+        _owner = owner; _matches = matches;
+        // A quote for the donor's worker shape cannot price a different explicit
+        // budget. Keep that unmeasured shape separate from donor timing evidence.
+        _quote = _workers == workers ? quote : null;
     }
     string IFamilyInvocation.FamilyId => _id;
     IReadOnlyList<string> IFamilyInvocation.Coverage => _owner!.Coverage;
@@ -61,25 +91,43 @@ internal sealed class FamilyCpuExecution : IFamilyInvocation
     private readonly IRuntimeProfile _profile;
     private readonly string _id, _revision;
     private readonly int _rootMode;
+    private readonly bool _usePrefixCache;
+    internal bool UsesPrefixCache => _usePrefixCache;
     private readonly int _workers;
     private readonly int _windowCapacity;
+    private readonly int _minimumPartitionSize;
     private readonly bool _partitioned;
     private bool _disabled, _compact;
     private int _batches, _steady;
     private long _inputs, _outputs, _liveInputs;
     private double _ms, _liveMs, _peak;
-    internal FamilyCpuExecution(ExactSearchExecutionRequest request, string id, string revision, int workers = 1, int windowCapacity = Capacity, bool numericalRoots = false)
+    internal FamilyCpuExecution(ExactSearchExecutionRequest request, string id, string revision, int workers = 1, int windowCapacity = Capacity, bool numericalRoots = false, int? rootMode = null,
+        CpuNeowBatchGate? batchNeowGate = null)
     {
-        _request = request; _id = id; _revision = revision; _profile = RuntimeProfileRegistry.Select(request.Detection);
-        if (workers is < 1 or > 32 || windowCapacity is < 1024 or > (1 << 20)) throw new ArgumentOutOfRangeException(nameof(workers));
-        _workers = workers; _windowCapacity = windowCapacity;
-        _partitioned = numericalRoots || workers > 1;
-        _rootMode = numericalRoots ? 2 : 0;
+        _request = request; _id = id; _profile = RuntimeProfileRegistry.Select(request.Detection);
+        if (workers is < 1 or > 64 || windowCapacity is < 1024 or > (1 << 20)) throw new ArgumentOutOfRangeException(nameof(workers));
+        SearchResourceBudget? resources = request.RunOptions.Resources;
+        _workers = resources is null ? workers : Math.Min(request.WorkerCount, resources.ResolveCpuWorkers(Environment.ProcessorCount));
+        _revision = resources is null ? revision : revision + ".ExplicitCpuBudget.v1";
+        _windowCapacity = windowCapacity;
+        // Legacy 8192-root CPU windows must also admit up to 64 explicitly
+        // budgeted workers; sparse inputs still avoid tiny parallel partitions.
+        _minimumPartitionSize = resources is null ? 1024 : 128;
+        _partitioned = numericalRoots || _workers > 1 || resources is not null;
+        _rootMode = rootMode ?? (numericalRoots ? 2 : 0);
+        if (_rootMode is < 0 or > 2) throw new ArgumentOutOfRangeException(nameof(rootMode));
         if (_rootMode != 0 && _profile.ProfileId != RuntimeProfileId.Beta111)
             throw new InvalidOperationException("CpuByteRootsRequireBeta111");
+        _usePrefixCache = request.RunOptions.Optimizations.PrefixCache &&
+            _profile.ProfileId == RuntimeProfileId.Beta111 && _profile.SeedLength == 12 &&
+            _profile.SeedAlphabet == Beta110SeedCodec.Alphabet;
+        _batchNeowGate = _partitioned && _usePrefixCache && request.RunOptions.Optimizations.CostOrderedFilters &&
+            CpuNeowBatchGate.HardwareSupported ? batchNeowGate : null;
     }
     internal FamilyConditionPerformanceProjection Condition(bool compact) => new(_id,
-        _revision + ".RootMode" + _rootMode + ".P" + (_partitioned ? _workers : 0) + ".B" + _windowCapacity + (compact ? ".CompactAbi1" : ".Dense") + ".CanonicalAbi1Ready",
+        _revision + ".RootMode" + _rootMode + ".P" + (_partitioned ? _workers : 0) + ".B" + _windowCapacity + (compact ? ".CompactAbi1" : ".Dense") +
+        (_usePrefixCache ? "." + CpuPrefixRootHasher.Revision : "") +
+        (_batchNeowGate is not null && !compact ? "." + CpuNeowBatchGate.Revision : "") + ".CanonicalAbi1Ready",
         "Cpu.NeutralCondition.20260905.v1", 1, "Neutral_NoAcceptedWithinPathCurve;device=CPU", usesGpu: false);
     internal FamilyCandidateSet Execute(FamilyObservationWindow window, FamilyCandidateSet input,
         CancellationToken token, Func<ulong, bool> matches)
@@ -105,14 +153,16 @@ internal sealed class FamilyCpuExecution : IFamilyInvocation
                 var chunk = new ulong[Math.Min(input.Count, Capacity)];
                 int chunkSurvivors = 0, chunkInputs = 0; chunks = 0;
                 Span<byte> seedBytes = stackalloc byte[Beta110SeedCodec.SeedLength];
-                bool carry = _rootMode == 2 && input.IsDense;
+                var prefixHasher = new CpuPrefixRootHasher();
+                bool carry = !_usePrefixCache && _rootMode == 2 && input.IsDense;
                 if (carry) Beta110SeedCodec.WriteOrdinal(input.Batch.BatchBase, seedBytes);
                 foreach (ulong ordinal in input.EnumerateLogicalOrdinals())
                 {
                     token.ThrowIfCancellationRequested();
                     ulong global = input.Batch.GlobalCandidate(ordinal);
                     ulong root;
-                    if (_rootMode == 0) root = _profile.ComputeRootSeed(VisibleSeedCandidateCodec.FormatOrdinal(_profile, global));
+                    if (_usePrefixCache) root = prefixHasher.ComputeRoot(global);
+                    else if (_rootMode == 0) root = _profile.ComputeRootSeed(VisibleSeedCandidateCodec.FormatOrdinal(_profile, global));
                     else
                     {
                         if (!carry) Beta110SeedCodec.WriteOrdinal(global, seedBytes);
@@ -139,7 +189,7 @@ internal sealed class FamilyCpuExecution : IFamilyInvocation
             _batches++; _inputs += input.Count; _outputs += result.Count; _ms += watch.Elapsed.TotalMilliseconds;
             // Only full-window, completed canonical CPU work is comparable to the atlas.
             // No survivor-based learning, Exact time, terminal wait or cold first invocation.
-            if (_batches > 1 && (RequiredPassedCoverage is null || _calibrationCoverageMatched) && input.Batch.BatchCandidateCount == _windowCapacity &&
+            if (!_usePrefixCache && (_batchNeowGate is null || _compact) && _batches > 1 && (RequiredPassedCoverage is null || _calibrationCoverageMatched) && input.Batch.BatchCandidateCount == _windowCapacity &&
                 (input.IsDense || CalibrationMeanInput.HasValue) &&
                 _quote?.Invoke(new(!input.IsDense,false,input.IsDense?_windowCapacity:CalibrationMeanInput!.Value)) is {} raw && watch.Elapsed.TotalMilliseconds > 0)
             {
@@ -192,25 +242,55 @@ internal sealed class FamilyCpuExecution : IFamilyInvocation
         int length = inputLength ?? input.Count;
         // Pure, batch-local CPU work. All partitions join before publishing ABI1;
         // the existing producer, Exact pipeline and safe cursor remain owners.
-        int count = Math.Min(_workers, Math.Max(1, length / 1024));
+        int count = Math.Min(_workers, Math.Max(1, length / _minimumPartitionSize));
         parts = count;
         var populations = new List<ulong>[count];
         void Partition(int part)
         {
+            using var cpuSlot = SearchCpuConcurrencyBudget.Acquire(token);
             int first = firstIndex + (int)((long)part * length / count);
             int end = firstIndex + (int)((long)(part + 1) * length / count);
             var output = new List<ulong>(Math.Min(end - first, 256));
             ReadOnlySpan<ulong> ordinals = input.IsDense ? default : input.ExportAbi1().Span;
             Span<byte> bytes = stackalloc byte[Beta110SeedCodec.SeedLength];
-            bool carry = _rootMode == 2 && input.IsDense;
+            var prefixHasher = new CpuPrefixRootHasher();
+            bool carry = !_usePrefixCache && _rootMode == 2 && input.IsDense;
             if (carry) Beta110SeedCodec.WriteOrdinal(input.Batch.GlobalCandidate((ulong)first), bytes);
-            for (int i = first; i < end; i++)
+            int i = first;
+            long batchBlocks = 0, batchRejected = 0;
+            if (input.IsDense && _batchNeowGate is { } batchGate)
+            {
+                // Scalar seed-prefix ownership is unchanged. Only the necessary
+                // first N observation is SoA4 AVX2; full accepted-lane matchers
+                // still own all identity/route work and ordinary CPU semantics.
+                int vectorEnd = end - (end - first) % 4;
+                for (; i < vectorEnd; i += 4)
+                {
+                    token.ThrowIfCancellationRequested();
+                    ulong root0 = prefixHasher.ComputeRoot(input.Batch.GlobalCandidate((ulong)i));
+                    ulong root1 = prefixHasher.ComputeRoot(input.Batch.GlobalCandidate((ulong)(i + 1)));
+                    ulong root2 = prefixHasher.ComputeRoot(input.Batch.GlobalCandidate((ulong)(i + 2)));
+                    ulong root3 = prefixHasher.ComputeRoot(input.Batch.GlobalCandidate((ulong)(i + 3)));
+                    int mask = batchGate.MatchesFour(root0, root1, root2, root3);
+                    batchBlocks++;
+                    batchRejected += 4 - System.Numerics.BitOperations.PopCount((uint)mask);
+                    for (int lane = 0; lane < 4; lane++)
+                    {
+                        if ((mask & (1 << lane)) == 0) continue;
+                        token.ThrowIfCancellationRequested();
+                        ulong root = lane switch { 0 => root0, 1 => root1, 2 => root2, _ => root3 };
+                        if (matches(root)) output.Add((ulong)(i + lane));
+                    }
+                }
+            }
+            for (; i < end; i++)
             {
                 token.ThrowIfCancellationRequested();
                 ulong ordinal = input.IsDense ? (ulong)i : ordinals[i];
                 ulong global = input.Batch.GlobalCandidate(ordinal);
                 ulong root;
-                if (_rootMode == 0) root = _profile.ComputeRootSeed(VisibleSeedCandidateCodec.FormatOrdinal(_profile, global));
+                if (_usePrefixCache) root = prefixHasher.ComputeRoot(global);
+                else if (_rootMode == 0) root = _profile.ComputeRootSeed(VisibleSeedCandidateCodec.FormatOrdinal(_profile, global));
                 else
                 {
                     if (!carry) Beta110SeedCodec.WriteOrdinal(global, bytes);
@@ -219,6 +299,11 @@ internal sealed class FamilyCpuExecution : IFamilyInvocation
                         throw new InvalidOperationException("CpuDensePartitionCarryOverflow");
                 }
                 if (matches(root)) output.Add(ordinal);
+            }
+            if (batchBlocks != 0)
+            {
+                Interlocked.Add(ref _batchNeowBlocks, batchBlocks);
+                Interlocked.Add(ref _batchNeowRejected, batchRejected);
             }
             populations[part] = output;
         }
@@ -240,6 +325,8 @@ internal sealed class FamilyCpuExecution : IFamilyInvocation
     {
         RuntimeLog.TryBackgroundInfo("cpuCostObservation=true;observationJson="+RuntimeLog.SafeJson(new{family=_id,workers=_workers,best=_localPeak,pendingInputs=_sampleInputs,pendingMs=_sampleMs,eligible=!_disabled,boundary=CpuCostCalibration.Boundary,compactEvidence="OnlyFullRootBatchesWithComparableModeledOccupancy",sameRunRepricing=false}));
         RuntimeLog.TryBackgroundInfo($"familyCpuSummary=true;family={_id};physicalRevision={Condition(_compact).PhysicalImplementationRevision};maxCpuWorkers={_workers};windowCapacity={_windowCapacity};timingBoundary=CanonicalAbi1Ready;denominator=ActualStageInput;batches={_batches};input={_inputs};survivors={_outputs};canonicalMs={_ms};recovery=False;faulted={_disabled}");
+        if (_batchNeowGate is not null)
+            RuntimeLog.TryBackgroundInfo($"cpuNeowBatchGate=true;family={_id};revision={CpuNeowBatchGate.Revision};denseOnly=True;avx2={CpuNeowBatchGate.HardwareSupported};blocks={Interlocked.Read(ref _batchNeowBlocks)};gateRejectedRoots={Interlocked.Read(ref _batchNeowRejected)};acceptedLanesUseScalarMatcher=True;rootHash=ExistingScalarPrefix;legacyCalibrationExcluded=True");
     }
     internal FamilyLivePerformanceSnapshot? Live() => _disabled || _batches < 2 ? null : new(_id,
         Condition(_compact).PhysicalImplementationRevision, Interlocked.Read(ref _liveInputs), Volatile.Read(ref _liveMs), _batches - 1);

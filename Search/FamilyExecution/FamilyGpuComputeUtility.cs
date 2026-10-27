@@ -7,10 +7,26 @@ namespace RolltheSpire2.Search.FamilyExecution;
 /// <summary>Minimal topology-neutral RenderingDevice helpers used by GPU Families.</summary>
 internal static class FamilyGpuComputeUtility
 {
+    // A failed initialization followed by a failed release leaves resource
+    // ownership uncertain. Preserve this fact through module/wrapper exceptions
+    // so an optional allocation fallback cannot silently reuse the device.
+    internal sealed class InitializationCleanupException(string scope, Exception primary, Exception cleanup)
+        : AggregateException(scope + ".InitializationAndCleanup", primary, cleanup) { }
+
+    internal static bool HasInitializationCleanupFailure(Exception failure) =>
+        failure is InitializationCleanupException ||
+        (failure is AggregateException aggregate
+            ? aggregate.InnerExceptions.Any(HasInitializationCleanupFailure)
+            : failure.InnerException is { } inner && HasInitializationCleanupFailure(inner));
+
     private const string VisibleSeedRootHashMarker = "/*__RT2_VISIBLE_SEED_ROOT_HASH__*/";
     private const string VisibleSeedRootHashCommonSuffix = "VisibleSeedRootHashCommon.glsl";
 
     [ThreadStatic] private static ShaderReuse? _shaderReuse;
+    [ThreadStatic] private static long _completedSubmissionTicks;
+    [ThreadStatic] private static long _lastSubmissionCompleted;
+    internal static long CompletedSubmissionTicks => _completedSubmissionTicks;
+    internal static long LastSubmissionCompleted => _lastSubmissionCompleted;
     [ThreadStatic] private static Dictionary<(RenderingDevice, Rid), ShaderReuse>? _borrowedShaders;
 
     // Owner-thread, search-local module reuse. Executors still own their pipelines
@@ -158,6 +174,9 @@ internal static class FamilyGpuComputeUtility
         // leave a submitted local device unsynchronized while unwinding.
         start = System.Diagnostics.Stopwatch.GetTimestamp();
         rd.Sync();
+        _lastSubmissionCompleted = System.Diagnostics.Stopwatch.GetTimestamp();
+        _completedSubmissionTicks += _lastSubmissionCompleted - start;
+        _completedSubmissionTicks += (long)(submitMs * System.Diagnostics.Stopwatch.Frequency / 1000);
         double syncMs = System.Diagnostics.Stopwatch.GetElapsedTime(start).TotalMilliseconds;
         if (first) RuntimeLog.TryBackgroundInfo($"searchStartup=true;phase=FirstSyncCompleted;family={Sanitize(family)};ownerThreadId={System.Environment.CurrentManagedThreadId}");
         return (submitMs, syncMs);
@@ -209,6 +228,16 @@ internal static class FamilyGpuComputeUtility
         return output;
     }
 
+    internal static uint[] FromUInt32Bytes(byte[] bytes, uint expectedCount)
+    {
+        // Godot may report a native readback failure by returning an empty
+        // buffer. Alignment alone cannot distinguish that from valid output.
+        // Widen before multiplication so even a malformed count cannot wrap.
+        if ((ulong)bytes.LongLength != (ulong)expectedCount * sizeof(uint))
+            throw new InvalidDataException("Family GPU payload length does not match header count.");
+        return expectedCount == 0 ? [] : FromUInt32Bytes(bytes);
+    }
+
     public static void Update(RenderingDevice rd, Rid buffer, uint[] values, string label)
     {
         byte[] bytes = ToBytes(values);
@@ -226,7 +255,7 @@ internal static class FamilyGpuComputeUtility
     internal static void CleanupAfterFailure(Exception primary, Action cleanup, string scope)
     {
         try { cleanup(); }
-        catch (Exception failure) { throw new AggregateException(scope + ".InitializationAndCleanup", primary, failure); }
+        catch (Exception failure) { throw new InitializationCleanupException(scope, primary, failure); }
     }
 
     public static void FreeAll(RenderingDevice rd, List<Rid> owned)

@@ -1,0 +1,233 @@
+{
+  "mechanismCount": 13,
+  "playerSwitches": [
+    "PrefixCache",
+    "ExactDrawIntervals",
+    "LeafyLazyInitialization",
+    "CostOrderedFilters",
+    "GroupedOutput",
+    "DoubleWindowBatching",
+    "AsyncHeaderReadback"
+  ],
+  "countingZh": "13项是机制清单，不是13个独立开关或13个可叠加收益。七个设置项默认全开；第4设置控制第11至13以及其内部顺序/报价子机制。全部开关关闭仍保留无独立开关的实现，不等于上游原版。",
+  "mechanisms": [
+    {
+      "id": 1,
+      "nameZh": "种子前缀哈希缓存",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "PrefixCache",
+      "scopeZh": "GPU已接入的开局、遗物、商店、奖励、事件、古人、世界、变牌等执行器；CPU限Beta111、12字符与匹配字母表的连续工作分区。缓存前8字符的纯哈希状态，不是奖励或RNG结果。",
+      "fallbackOrDisableZh": "关闭后对应路线用完整哈希，并禁止依赖前缀缓存的CPU四路预筛；格式或准入不符按原哈希。合法起点/未对齐断点保留。",
+      "limitsZh": "GPU共享表按实际编号取值，每表至多14行/240字节；超过现有16M有界表覆盖用完整哈希。CPU前缀本身不要求AVX2；不能称所有路线均已接入。",
+      "evidence": [
+        "Search/FamilyExecution/PrefixHashCache.cs",
+        "Search/FamilyExecution/SharedVisibleSeedGpuCache.cs",
+        "Search/FamilyExecution/CpuPrefixRootHasher.cs",
+        "Search/FamilyExecution/FamilyCpuExecution.cs"
+      ]
+    },
+    {
+      "id": 2,
+      "nameZh": "快速精确抽取区间",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "ExactDrawIntervals",
+      "scopeZh": "开局首诅咒与适用叶药布尔前筛，使用等价53位随机整数接受区间。",
+      "fallbackOrDisableZh": "关闭、等价性不能证明或每目标超过2段预算时保留原谓词。",
+      "limitsZh": "不是全部卡牌/事件/最终诅咒的通用区间算法；重复成员、相同/无序双目标和RNG语义必须保持。",
+      "evidence": [
+        "Search/FamilyExecution/NeowFamilyGpuExecutor.StaticDrawGates.cs"
+      ]
+    },
+    {
+      "id": 3,
+      "nameZh": "叶药按需初始化",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "LeafyLazyInitialization",
+      "scopeZh": "已证明安全的叶药双目标捷径，第一抽已不匹配时省去后续准备与计算。",
+      "fallbackOrDisableZh": "关闭、形状复杂或准入不符时用原初始化/检查，后续完整Exact保留。",
+      "limitsZh": "只适用部分叶药双目标前筛，不能推广全部叶药或全部预设。",
+      "evidence": [
+        "Search/FamilyExecution/NeowFamilyGpuExecutor.StaticDrawGates.cs",
+        "Search/FamilyExecution/NeowFamily.cs"
+      ]
+    },
+    {
+      "id": 4,
+      "nameZh": "按成本安排筛选及已证明的顺序提前淘汰",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "CostOrderedFilters",
+      "scopeZh": "在依赖关系允许且报价完整时按成本/淘汰率/候选规模规划。包含适用单人分阶段Dense开局最终诅咒必要条件前置；Beta111精确商店有序1至5店条件转为逐店位置；E/S Compact 64至1,048,575候选的保守有界报价补齐。也控制第11至13机制。",
+      "fallbackOrDisableZh": "关闭后禁用这些新增顺序、四路预筛、池准备、稀疏报价补齐和同候选开局复用。未知形状、权威数据/报价缺失沿原路径。",
+      "limitsZh": "开局多人/复合/joint变牌/Compact或私有输入等保留原顺序；私有输出不能一概排除。有序商店只提前淘汰已证明位置，不改变无序前三店任一语义，末尾通配不延长范围。稀疏报价为估算，非新硬件实测或新执行能力。",
+      "evidence": [
+        "Search/FamilyExecution/NeowInternalFilterOrder.cs",
+        "Search/FamilyExecution/NeowFamilyGpuExecutor.InternalOrder.cs",
+        "Search/FamilyExecution/MerchantShopColorlessOrderedSequencePolicy.cs",
+        "Search/FamilyExecution/CompactSparseGpuPricing.cs",
+        "Search/FamilyExecution/EventResultPhysicalPricing.cs",
+        "Search/FamilyExecution/MerchantShopColorlessPhysicalPricing.cs"
+      ]
+    },
+    {
+      "id": 5,
+      "nameZh": "GPU工作组汇总候选",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "GroupedOutput",
+      "scopeZh": "适用单人分阶段Dense开局stage0/4，先在工作组汇总再合作写入。",
+      "fallbackOrDisableZh": "关闭或门槛不符使用原输出；stage1/2保持原实现。",
+      "limitsZh": "每组至多512候选，6152字节共享内存；不新增设备缓冲/CPU回读/等待。Compact、私有输入、多人、复合、joint变牌等不适用；私有输出不是一概排除条件。",
+      "evidence": [
+        "Search/FamilyExecution/NeowFamilyGpuExecutor.GroupOutput.cs"
+      ]
+    },
+    {
+      "id": 6,
+      "nameZh": "双窗口批处理",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "DoubleWindowBatching",
+      "scopeZh": "适用单人Leafy前筛、分阶段Dense、非私有输入输出/非复合/非多人且GPU预算100%的大批量路线，合并相邻两个独立16M窗口的提交/同步。",
+      "fallbackOrDisableZh": "关闭或准入不符用单窗；可选第二窗口初始化失败且清理成功时按原窗口顺序运行。",
+      "limitsZh": "额外显存约180MiB；高通过率、CPU终检瓶颈、较少显存时不保证提速，取消粒度可能变粗。基础初始化/清理/已提交计算错误必须报错，不能伪装安全回退或重跑失败提交。",
+      "evidence": [
+        "Search/FamilyExecution/NeowFamilyGpuExecutor.cs",
+        "Search/FamilyExecution/FamilyExecutionCoordinator.cs"
+      ]
+    },
+    {
+      "id": 7,
+      "nameZh": "同次提交状态头异步回传及自适应稀疏载荷预取",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "AsyncHeaderReadback",
+      "scopeZh": "支持的GPU状态头在同一次原提交前登记回传；开局公有输出保留由真实稀疏候选触发的有界载荷预取。",
+      "fallbackOrDisableZh": "关闭为同步回读；登记接口不支持时仍只提交一次后同步读取。结果量超预取范围按真实数量完整读取，错误终止。",
+      "limitsZh": "稀疏预取默认休眠，真实数量1至1024时激活后续64物理窗口，空窗递减，超过1024停用，活跃时至多4KiB；左右窗分别维护历史，私有输出/空输入不预取。此开关不控制第10机制。",
+      "evidence": [
+        "Search/FamilyExecution/FamilyGpuHeaderReadback.cs",
+        "Search/FamilyExecution/NeowSparsePayloadReadback.cs"
+      ]
+    },
+    {
+      "id": 8,
+      "nameZh": "商店末尾13步延迟推进",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": null,
+      "scopeZh": "适用商店GPU预测先检查当前店，只有还需后店且当前未淘汰才推进末尾13步。",
+      "fallbackOrDisableZh": "无需/不适用时沿原预测，不能错误提前淘汰无序任一命中。",
+      "limitsZh": "自动选择，无独立玩家开关；继续到后店时必须保持完整店间28步随机推进。与第4机制有序位置下放不同。",
+      "evidence": [
+        "Search/FamilyExecution/Shaders/MerchantShopColorless.comp.glsl"
+      ]
+    },
+    {
+      "id": 9,
+      "nameZh": "仅Boss身份需求的Exact按需输出",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": null,
+      "scopeZh": "普通单人Beta111搜索的世界事实仅含Boss身份时，省去未被查询的事件、遭遇、古人输出及逐步诊断；遗物初始化保持相同随机消费但不建临时洗牌数组。",
+      "fallbackOrDisableZh": "地图、Party、多人、更多世界条件、变牌聚合、单种分析、显式诊断/追踪等保留完整模式。",
+      "limitsZh": "保留遭遇重试、古人身份抽取、A10第二Boss及其他域Exact；自动选择，无独立玩家开关。",
+      "evidence": [
+        "Search/Runtime/ExactWorldProjectionPolicy.cs",
+        "Search/Runtime/ProductionExactSearchEvaluator.cs"
+      ]
+    },
+    {
+      "id": 10,
+      "nameZh": "正式界面后台单消费者接收与主线程分批入库",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": null,
+      "scopeZh": "后台仅搬运不可变候选到有界缓冲，Godot/保存/显示由主线程负责，每批默认至多64并节流刷新。",
+      "fallbackOrDisableZh": "取消后继续接收已发布尾部；关闭页面由持久化层接管，保存失败保留所有权并重试。",
+      "limitsZh": "无独立玩家开关。普通UI target在1至1000，接收缓冲容量等于target且会话总发布不超过target，因此不能归因于UI按帧排空导致该缓冲持续堵满。30/60FPS差异仍可能存在，但本次审计不证明单一根因。",
+      "evidence": [
+        "Ui/Persistence/SearchResultReceiver.cs:12",
+        "Ui/Persistence/SearchWorkspacePersistence.Session.cs:36",
+        "Ui/Shell/QueryWorkbenchFrame.Search.cs:307",
+        "Search/Runtime/ProductionSearchSession.cs"
+      ]
+    },
+    {
+      "id": 11,
+      "nameZh": "CPU AVX2四路开局必要条件预筛",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "CostOrderedFilters + PrefixCache",
+      "scopeZh": "CPU支持AVX2、单人Beta111连续CPU枚举、精确开局身份和池数据等门槛全部满足时，四根一起判断首诅咒必要条件；幸存者仍跑原匹配与Exact。",
+      "fallbackOrDisableZh": "关闭任一所需开关、无AVX2、Compact候选输入、不适用形状或不足四根尾部均回退标量。",
+      "limitsZh": "不是四路完整Exact；不新增指令集安装包。无AVX2仍支持原标量。属于第4机制控制的独立实现，不能把两者收益相加。",
+      "evidence": [
+        "Search/FamilyExecution/CpuNeowBatchGate.cs:21",
+        "Search/FamilyExecution/CpuNeowBatchGate.cs:36",
+        "Search/FamilyExecution/FamilyCpuExecution.cs"
+      ]
+    },
+    {
+      "id": 12,
+      "nameZh": "编译会话时准备战斗奖励固定池",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "CostOrderedFilters",
+      "scopeZh": "适用单人Beta110/Beta111、需要普通战斗奖励、卡/药池精确时，编译会话阶段复制冻结池，复用排序/校验/指纹。",
+      "fallbackOrDisableZh": "关闭、多人、池未知/无效等沿原路径。",
+      "limitsZh": "每种子RNG、开局路线、奖励生成和Exact仍执行；不是全局可变引用缓存。正式resource17尚不含最近尝试03的稀有度/类型排名索引。",
+      "evidence": [
+        "Core/Rewards/PreparedCombatRewardPools.cs",
+        "Search/Compilation/ExactSearchExecutionRequestFactory.cs"
+      ]
+    },
+    {
+      "id": 13,
+      "nameZh": "同候选cheap至reward阶段的开局Exact推演复用",
+      "installed": true,
+      "defaultEnabled": true,
+      "playerSwitch": "CostOrderedFilters",
+      "scopeZh": "单人Beta111、slot0、无Party/开局覆盖且需要普通战斗奖励时，在同一种子本次Exact两次同步调用之间传递已验证开局身份/效果证明。",
+      "fallbackOrDisableZh": "证明缺失、任何严格绑定不符或关闭时重新按原推演。",
+      "limitsZh": "种子/根哈希、规则版本、权威快照、角色/进阶、槽位、预览/古人、诊断/复杂开关和兼容精度等必须匹配；只复用局部证明，不进计划/请求/全局缓存，不跨种子/候选。依赖捕获快照契约，不能声称只读接口本身等于深不可变；奖励/RNG/完整验证不省略。",
+      "evidence": [
+        "Search/Runtime/ProductionExactSearchEvaluator.cs:31",
+        "Compatibility/RuntimeProfileRegistry.cs",
+        "Core/Prediction/Profiles/Beta111PredictionProfile.cs",
+        "Core/Prediction/Profiles/Beta111NeowOpeningProof.cs"
+      ]
+    }
+  ],
+  "resourceAndCheckpointNotAcceleration": {
+    "cpuZh": "默认50%，1至100%约束筛选与Exact共用线程上限；ceil(逻辑处理器数*百分比/100)，夹在1至64；工作不足不空转。",
+    "gpuZh": "默认100%，0强制CPU；1至99通过可取消等待限制计算占空比；100取消人为等待且为双窗口必要条件。不是操作系统利用率/功耗固定目标。",
+    "checkpointZh": "精确NextCursor含后四位偏移，未完成批次不冒充完成；取消可安全重算少量工作；结果按种子去重；预算/优化设置不改语义断点身份，查询/环境改变按保存起点重启。是继续/正确性功能，不作为加速项。",
+    "randomStartZh": "随机前8字符加0000只决定枚举起点，手动合法12位起点与旧游标保留，不固定奖励或缩小完整种子空间。"
+  },
+  "fpsAttributionCorrection": {
+    "normalUiZh": "target<=1000，缓冲容量=target，会话总发布<=target；默认30。源队列64和接收缓冲不是同一个队列；不能用旧说明的源队列64推断正式UI接收缓冲因每帧64入库而持续满。",
+    "historicalPressureZh": "resource16产品接收器层65536缓冲、4096源队列压力测试的峰值均低于65536（22534/21678/13611/13990及23404/23439/14703/14539）；因此18.4528%和22.5083%左右的30/60FPS吞吐差异只能作为观测，不能断言由接收缓冲满或UI排空背压导致。该层不包含完整UI保存/渲染。",
+    "scopeZh": "不声称全部帧率影响已消除；也不能把这些resource16历史结果改标为resource17全UI新测。",
+    "evidence": [
+      ".build-evidence/resource16-async-results-20261026/product-receiver/runs/measure-v1/summary.json",
+      "Ui/Persistence/SearchResultReceiver.cs",
+      "Ui/Persistence/SearchWorkspacePersistence.Session.cs",
+      "Ui/Shell/QueryWorkbenchFrame.Search.cs"
+    ]
+  },
+  "notInstalledOrNotEnabled": {
+    "developmentOnlyZh": "最近九次新尝试只03奖励池稀有度/类型索引、04假商人Suffix在开发代码中保留，未安装正式包；08/09否决。应另列开发实验，不能加入本清单或上传到正式resource17二进制。",
+    "pausedWorkZh": "QoS/后台60FPS尚未正式实装，不得写成已启用，也未在本审计中恢复。",
+    "otherDisabledZh": "万花筒卡池预筛、最终诅咒区间、Bones省略内部洗牌的诊断试验在正式编译Capture分支返回default；事件局部组惰性、额外批量接收和其他撤回方案不能列为当前保留。",
+    "evidence": [
+      ".build-evidence/nine-attempts-20261027/progress.json",
+      "Search/FamilyExecution/NeowStructuralOptimizations.cs:11"
+    ]
+  },
+  "version": "1.3.5-resource.17",
+  "formalDllSha256": "200BB90F8CEABE090B350B653CF25516BCB1512DCFB83E8E3F31AC82947DE30F"
+}

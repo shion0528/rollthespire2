@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>ProductionSearchHost</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Rt2AssemblyPath Condition="'$(Rt2AssemblyPath)' == ''">$(MSBuildThisFileDirectory)../../.godot/mono/temp/bin/Release/RolltheSpire2.dll</Rt2AssemblyPath>
+  </PropertyGroup>
+  <Import Project="../../Sts2PathDiscovery.props" />
+  <ItemGroup>
+    <Reference Include="RolltheSpire2"><HintPath>$(Rt2AssemblyPath)</HintPath><Private>true</Private></Reference>
+    <Reference Include="GodotSharp"><HintPath>$(Sts2ReferenceDir)/GodotSharp.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="sts2"><HintPath>$(Sts2ReferenceDir)/sts2.dll</HintPath><Private>true</Private></Reference>
+    <Reference Include="0Harmony"><HintPath>$(Sts2ReferenceDir)/0Harmony.dll</HintPath><Private>true</Private></Reference>
+  </ItemGroup>
+</Project>

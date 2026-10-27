@@ -94,15 +94,24 @@ internal static class EventResultPhysicalPricing
     private static FamilyPhysicalQuote? QuoteModel(EventResultFamilyPlan plan, FamilyPhysicalQuoteRequest g)
     {
         if (!ModelSupported(plan) || !FamilyPhysicalQuote.AdmittedRequest(g) ||
-            !FamilyPhysicalQuote.HasReferenceBackend() || g.MeanInputPopulation < 1048576) return null;
+            !FamilyPhysicalQuote.HasReferenceBackend()) return null;
         // Each operator generates its facts once before target comparisons. GPU
         // Grab/Dive share the Trash draw; additional targets do not replay Fake.
         bool fake = plan.Conditions.Any(c => c.Kind == EventResultConditionKind.FakeMerchantOfferedFakeRelic);
         double extra = Math.Max(0, plan.Conditions.Length - 2) * .08;
-        return new("E.EventResult", "E.OperatorGroups.20260913.v1", (fake ? .95 : .55) + extra,
+        double ns = (fake ? .95 : .55) + extra;
+        bool sparse = g.MeanInputPopulation < CompactSparseGpuPricing.DenseAnchorPopulation;
+        double? fixedMs = sparse ? CompactSparseGpuPricing.AdditionalFixedMilliseconds(
+            SearchOptimizationScope.Current.CostOrderedFilters, g.CompactInput, g.MeanInputPopulation, ns) : 0;
+        if (fixedMs is null) return null;
+        return new("E.EventResult", "E.OperatorGroups.20260913.v1" +
+            (sparse ? "." + CompactSparseGpuPricing.Revision : ""), ns,
             plan.Capacity, 40, "FamilyCostClosure.20260913;Model=BoundedCoarse;OperatorFactsOnce;" +
-            "Predicates1..8;ExtraComparisonEnvelope;MinInput=1048576;NumericalDeviceEmission;HostPayloadExcluded;metric=ns/ActualStageInput;" +
-            (extra > 0 ? "ConservativeCoarse" : "ValidatedOperatorRegion"));
+            "Predicates1..8;ExtraComparisonEnvelope;" + (sparse ? "DenseAnchorMinInput=1048576;" : "MinInput=1048576;") +
+            "NumericalDeviceEmission;HostPayloadExcluded;metric=ns/ActualStageInput;" +
+            (extra > 0 ? "ConservativeCoarse" : "ValidatedOperatorRegion") +
+            (sparse ? ";" + CompactSparseGpuPricing.Evidence : ""))
+        { FixedWindowMilliseconds = fixedMs.Value };
     }
 
     internal static FamilyPhysicalQuote? QuoteCpu(ExactSearchExecutionRequest request, EventResultFamilyPlan plan, FamilyPhysicalQuoteRequest g)

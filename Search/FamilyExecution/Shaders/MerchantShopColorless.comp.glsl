@@ -88,7 +88,6 @@ bool evaluate_merchant_colorless(uint64_t root) {
         uncommon[ordinal - 1u] = next_int(uncommon_pool_count);
         consume_rng();
         rare[ordinal - 1u] = next_int(rare_pool_count);
-        for (uint call = 0u; call < 13u; ++call) consume_rng();
         for (uint index = 0u; index < slot_count; ++index) {
             uint base = 7u + index * 3u;
             if (merchant_plan_buffer.values[base] != ordinal) continue;
@@ -124,6 +123,11 @@ bool evaluate_merchant_colorless(uint64_t root) {
                 }
             }
         }
+        // S exports only candidate ordinals, never the terminal Shops state.
+        // Reject before the unused price/relic/potion tail; a later merchant
+        // still starts after the same complete 28-call continuation.
+        if (ordinal < max_ordinal)
+            for (uint call = 0u; call < 13u; ++call) consume_rng();
     }
     return true;
 }

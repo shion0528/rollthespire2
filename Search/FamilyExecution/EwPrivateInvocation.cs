@@ -4,6 +4,7 @@ namespace RolltheSpire2.Search.FamilyExecution;
 
 internal sealed class EwPrivateInvocation(ExactSearchExecutionRequest request, EventResultFamilyPlan e, WorldFamilyGpuPlan w, string mode) : IFamilyInvocation
 {
+    private readonly FamilyHeaderTransportPerformance _headerTransport = new(request.RunOptions.Optimizations);
     private EwPrivateGpuExecutor? _gpu;
     private long _input, _output;
     private int _batches;
@@ -13,8 +14,16 @@ internal sealed class EwPrivateInvocation(ExactSearchExecutionRequest request, E
     public IReadOnlyList<string> Coverage => ["E.EventResult","W.World"];
     public FamilyAnalyticalCostProjection AnalyticalCost => new(FamilyId,EwPrivateGpuExecutor.MaxRoots,[],"EW.UnpricedEquivalentCoverage");
     public FamilySurvivalProjection Survival => FamilySurvivalProjection.Unresolved(FamilyId,"EW.JointUnpriced");
-    public FamilyConditionPerformanceProjection ConditionPerformance => new(FamilyId,
-        "E.EventResult.Composite.W.World.PrivateOrdinal.CanonicalAbi1Ready.20260908.v2", "EW.Neutral",1,"EW.UnpricedCandidate",usesGpu:true);
+    public FamilyConditionPerformanceProjection ConditionPerformance
+    {
+        get
+        {
+            using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
+            return _headerTransport.Apply(new(FamilyId,
+                "E.EventResult.Composite.W.World.PrivateOrdinal.CanonicalAbi1Ready.20260908.v2" + SharedVisibleSeedGpuCache.RevisionSuffix,
+                "EW.Neutral",1,"EW.UnpricedCandidate",usesGpu:true), _gpu?.HeaderReadbackRevision);
+        }
+    }
     public FamilyPerformanceObservation CapturePerformanceObservation() => new(ConditionPerformance,_gpu?.Device??"",_gpu?.SetupMs??0,
         0,0,_batches,0,_input,_output,_ms,false,_faulted?"PhysicalFailureOrRecovery":"EW.CandidateNoCalibration");
     public async ValueTask<FamilyCandidateSet> InvokeAsync(FamilyExecutionContext context, FamilyObservationWindow observation, FamilyCandidateSet input, CancellationToken token)

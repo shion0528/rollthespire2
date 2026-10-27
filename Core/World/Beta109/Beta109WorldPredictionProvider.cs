@@ -42,7 +42,8 @@ public static class Beta109WorldPredictionProvider
         int playerSlotIndex,
         ModelKey characterKey,
         WorldAuthoritySnapshot world,
-        AncientOptionConditionProfile ancientOptionConditions)
+        AncientOptionConditionProfile ancientOptionConditions,
+        WorldPredictionProjection projection = WorldPredictionProjection.All)
     {
         Beta109WorldGenerationSnapshot? source = world.Beta109Generation;
         if (source is null)
@@ -60,7 +61,8 @@ public static class Beta109WorldPredictionProvider
             playerSlotIndex,
             characterKey,
             world,
-            ancientOptionConditions);
+            ancientOptionConditions,
+            projection);
     }
 
     private static WorldPredictionResult PredictProjected(
@@ -69,8 +71,12 @@ public static class Beta109WorldPredictionProvider
         int playerSlotIndex,
         ModelKey characterKey,
         WorldAuthoritySnapshot world,
-        AncientOptionConditionProfile ancientOptionConditions)
+        AncientOptionConditionProfile ancientOptionConditions,
+        WorldPredictionProjection projection = WorldPredictionProjection.All)
     {
+        if (projection is not (WorldPredictionProjection.All or WorldPredictionProjection.BossIdentityOnly))
+            throw new ArgumentOutOfRangeException(nameof(projection));
+        bool bossOnly = projection == WorldPredictionProjection.BossIdentityOnly;
         if (!RuntimeProfilePolicies.IsModernCore(snapshot.Profile) ||
             snapshot.Ascension != ascension ||
             snapshot.CharacterKey != characterKey ||
@@ -152,7 +158,7 @@ public static class Beta109WorldPredictionProvider
                 issue);
         }
 
-        Beta109WorldRng upFront = CreateUpFront(snapshot);
+        Beta109WorldRng upFront = CreateUpFront(snapshot, captureTrace: !bossOnly);
         bool prefixExact = snapshot.UpFrontPrefix.PriorInputsExact &&
                            snapshot.UpFrontPrefix.Kind != Beta109UpFrontPrefixAuthorityKind.Missing;
         Dictionary<int, List<ModelKey>> sharedByAct = AssignSharedAncients(
@@ -213,7 +219,7 @@ public static class Beta109WorldPredictionProvider
                     snapshot.ModeFactsExact && snapshot.IsMultiplayerExact,
                     snapshot.EventAuthority.CharacterCardPoolCount,
                     snapshot.EventAuthority.CharacterCardPoolCountExact);
-                eventSequences.Add(EventPoolSequenceProjector.Complete(
+                if (!bossOnly) eventSequences.Add(EventPoolSequenceProjector.Complete(
                     snapshot.Profile,
                     preparedEvents,
                     EventEffectiveCandidateContext.AuthoritativeOpeningAncient(
@@ -258,7 +264,7 @@ public static class Beta109WorldPredictionProvider
                 eliteHistory,
                 $"act{act.Act}:elite");
 
-            encounterSequences.Add(Beta109EncounterSequenceProjection.Build(act, normalHistory, eliteHistory, snapshot, world));
+            if (!bossOnly) encounterSequences.Add(Beta109EncounterSequenceProjection.Build(act, normalHistory, eliteHistory, snapshot, world));
 
             ModelKey boss = upFront.NextModelKey(act.Bosses, $"act{act.Act}:boss:first");
             if (snapshot.IsMultiplayer && snapshot.PartyBossDiscoveryOverrides.TryGetValue(act.ActKey.Serialized, out var discoveryBoss))
@@ -289,6 +295,7 @@ public static class Beta109WorldPredictionProvider
 
             if (ancientPool.Count == 0)
             {
+                if (bossOnly) continue;
                 ancients.Add(new AncientPredictionResult(
                     act.Act,
                     default,
@@ -314,6 +321,10 @@ public static class Beta109WorldPredictionProvider
             }
 
             ModelKey ancient = upFront.NextModelKey(ancientPool, $"act{act.Act}:ancient:identity");
+            // The identity draw belongs to up_front and is mandatory even when
+            // no Ancient output was requested. Options use an independent
+            // event-local RNG and cannot affect any later boss draw.
+            if (bossOnly) continue;
             Beta109AncientOptionPrediction optionPrediction = Beta109AncientOptionProvider.Predict(
                 snapshot,
                 act.Act,
@@ -399,7 +410,7 @@ public static class Beta109WorldPredictionProvider
             snapshot.HasExactReplayInputs && !snapshot.AllowsAncientIdentityProductionExact
                 ? "PendingRealGameAncientIdentityFixture"
                 : commonIssue;
-        EventPoolSequencePredictionResult eventPrediction = runtimeAuthorityExact &&
+        EventPoolSequencePredictionResult? eventPrediction = bossOnly ? null : runtimeAuthorityExact &&
                                                                     string.IsNullOrWhiteSpace(eventSequenceIssue) &&
                                                                     eventSequences.Count == snapshot.SelectedActs.Count
             ? EventPoolSequenceProjector.Build(
@@ -420,7 +431,7 @@ public static class Beta109WorldPredictionProvider
             ancients.Count > 0 ? SeedDomainEvaluationStatus.Evaluated : SeedDomainEvaluationStatus.Unknown,
             bosses,
             ancients,
-            Diagnostics(snapshot, string.Join("|", new[] { bossIssue, ancientIssue }
+            bossOnly ? Array.Empty<PredictionDiagnostic>() : Diagnostics(snapshot, string.Join("|", new[] { bossIssue, ancientIssue }
                 .Where(issue => !string.IsNullOrWhiteSpace(issue))
                 .Distinct(StringComparer.Ordinal))),
             bosses.Count > 0 ? bossIssue : "ModernBossPredictionUnavailable",
@@ -459,17 +470,22 @@ public static class Beta109WorldPredictionProvider
             : string.Join("+", assumptions);
     }
 
-    private static Beta109WorldRng CreateUpFront(Beta109WorldGenerationSnapshot snapshot)
+    private static Beta109WorldRng CreateUpFront(Beta109WorldGenerationSnapshot snapshot, bool captureTrace = true)
     {
         if (snapshot.UpFrontPrefix.Kind == Beta109UpFrontPrefixAuthorityKind.ExactCheckpoint &&
             snapshot.UpFrontPrefix.Checkpoint is not null)
         {
-            return Beta109WorldRng.FromCheckpoint(snapshot.UpFrontPrefix.Checkpoint);
+            return Beta109WorldRng.FromCheckpoint(snapshot.UpFrontPrefix.Checkpoint, "up_front", captureTrace);
         }
 
-        Beta109WorldRng rng = Beta109WorldRng.CreateNamed(snapshot.RunSeedRoot, "up_front");
+        Beta109WorldRng rng = Beta109WorldRng.CreateNamed(snapshot.RunSeedRoot, "up_front", captureTrace);
         foreach (Beta109RelicBucketSnapshot bucket in snapshot.SharedRelicBuckets)
         {
+            if (!captureTrace)
+            {
+                rng.ConsumeUnobservedShuffle(bucket.OrderedRelics.Count);
+                continue;
+            }
             List<ModelKey> items = bucket.OrderedRelics.ToList();
             rng.UnstableShuffle(items, "initialize:shared-relic-bag:" + bucket.BucketId);
         }
@@ -477,6 +493,11 @@ public static class Beta109WorldPredictionProvider
             ? snapshot.PartyRelicBuckets.SelectMany(buckets => buckets)
             : snapshot.PlayerRelicBuckets)
         {
+            if (!captureTrace)
+            {
+                rng.ConsumeUnobservedShuffle(bucket.OrderedRelics.Count);
+                continue;
+            }
             List<ModelKey> items = bucket.OrderedRelics.ToList();
             rng.UnstableShuffle(items, "initialize:player-relic-bag:" + bucket.BucketId);
         }

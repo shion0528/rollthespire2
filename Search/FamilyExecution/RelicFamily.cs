@@ -29,12 +29,14 @@ internal sealed partial class RelicFamily : IFamilyInvocation
         PrivateOrdinalBuffer? input, PrivateOrdinalBuffer? output)
     {
         if (_gpuDisabled) throw new InvalidOperationException("R.PrivateSerialFaulted");
-        return RelicFamilyGpuExecutor.Create(rd, _request, _plan, input, output).BindPrivateSerial();
+        var gpu = RelicFamilyGpuExecutor.Create(rd, _request, _plan, input, output);
+        return _headerTransport.Bind(gpu.BindPrivateSerial(), input, output, () => gpu.HeaderReadbackRevision);
     }
     private const int ReferenceSampleCapacity = 256;
     private const int PerformanceSamplePeriod = 256;
     private const int InitialPerformanceSampleCount = 3;
     private readonly ExactSearchExecutionRequest _request;
+    private readonly FamilyHeaderTransportPerformance _headerTransport;
     private readonly IRuntimeProfile _profile;
     private readonly RelicFamilyPlan _plan;
     private readonly FamilyAnalyticalCostProjection _analyticalCost;
@@ -76,29 +78,36 @@ internal sealed partial class RelicFamily : IFamilyInvocation
 
     private RelicFamily(ExactSearchExecutionRequest request, IRuntimeProfile profile, RelicFamilyPlan plan)
     {
+        using var optimizationScope = SearchOptimizationScope.Enter(request.RunOptions.Optimizations);
+        _headerTransport = new(request.RunOptions.Optimizations);
         _request = request;
         _profile = profile;
         _plan = plan;
         _analyticalCost = RelicFamilyAnalyticalCost.Project(plan);
         _survival = RelicFamilySurvival.Project(request);
         _expectedFilteringCost = RelicExpectedFilteringCost.Project(request, plan, _analyticalCost, _survival);
+        string prefixRevision = SharedVisibleSeedGpuCache.RevisionSuffix;
         _denseConditionPerformance = RelicConditionPerformance.Project(
-            plan, FamilyPhysicalImplementationRevisions.RelicDensePerformance);
+            plan, FamilyPhysicalImplementationRevisions.RelicDensePerformance + prefixRevision);
         _compactConditionPerformance = RelicConditionPerformance.Project(
-            plan, FamilyPhysicalImplementationRevisions.RelicCompactPerformance);
+            plan, FamilyPhysicalImplementationRevisions.RelicCompactPerformance + prefixRevision);
     }
 
     public string FamilyId => "R.Relic";
     internal string PricingSignature => $"last={_plan.LastRequiredBucket};pool=" + string.Join(',', _plan.Pool.BucketLengths) +
         ";tracked=" + string.Join(',', _plan.TrackedCountsByLane) + ";depth=" + string.Join(',', _plan.PositiveDepthByLane);
-    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest request) =>
-        RelicPhysicalPricing.Quote(_request, _plan, request, _expectedFilteringCost);
+    public FamilyPhysicalQuote? QuotePhysicalWork(FamilyPhysicalQuoteRequest request)
+    {
+        using var optimizationScope = SearchOptimizationScope.Enter(_request.RunOptions.Optimizations);
+        return RelicPhysicalPricing.Quote(_request, _plan, request, _expectedFilteringCost);
+    }
     public FamilyAnalyticalCostProjection AnalyticalCost => _analyticalCost;
     public FamilySurvivalProjection Survival => _survival;
     public FamilyExpectedFilteringCostProjection ExpectedFilteringCost => _expectedFilteringCost;
-    public FamilyConditionPerformanceProjection ConditionPerformance => _denseConditionPerformance;
+    public FamilyConditionPerformanceProjection ConditionPerformance => ResolveConditionPerformance(false);
     public FamilyConditionPerformanceProjection ResolveConditionPerformance(bool compactAbi1Input) =>
-        compactAbi1Input ? _compactConditionPerformance : _denseConditionPerformance;
+        _headerTransport.Apply(compactAbi1Input ? _compactConditionPerformance : _denseConditionPerformance,
+            _gpu?.HeaderReadbackRevision);
     internal int PreferredExecutionWindowSize => RelicFamilyGpuExecutor.Capacity;
 
     public static bool TryCreate(ExactSearchExecutionRequest request, out IFamilyInvocation? family)

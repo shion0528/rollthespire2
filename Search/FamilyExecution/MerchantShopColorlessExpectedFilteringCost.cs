@@ -18,6 +18,15 @@ internal static class MerchantShopColorlessExpectedFilteringCost
         FamilySurvivalProjection survival)
     {
         ArgumentNullException.ThrowIfNull(request);
+        return ProjectPhysical(request, request.Evaluation, fullCost, survival);
+    }
+
+    internal static FamilyExpectedFilteringCostProjection ProjectPhysical(
+        ExactSearchExecutionRequest request, ExactSearchEvaluationProjection physicalEvaluation,
+        FamilyAnalyticalCostProjection fullCost, FamilySurvivalProjection survival)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(physicalEvaluation);
         ArgumentNullException.ThrowIfNull(fullCost);
         ArgumentNullException.ThrowIfNull(survival);
 
@@ -30,7 +39,7 @@ internal static class MerchantShopColorlessExpectedFilteringCost
 
         try
         {
-            return Build(request.Evaluation, fullCost, authority, survival.SurvivalProbability);
+            return Build(physicalEvaluation, fullCost, authority, survival.SurvivalProbability);
         }
         catch (Exception ex)
         {

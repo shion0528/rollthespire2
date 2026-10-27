@@ -56,6 +56,15 @@ public static class SearchExecutionRequestFactory
             return SearchExecutionCompileResult.Rejected(SearchDisposition.Unsupported, "TargetMatchCountMustBePositive");
         if (runOptions.WorkerCount is < 1 or > 64)
             return SearchExecutionCompileResult.Rejected(SearchDisposition.Unsupported, "WorkerCountOutsideSupportedRange");
+        if (runOptions.Resources is { } resources)
+        {
+            if (resources != resources.Normalize())
+                return SearchExecutionCompileResult.Rejected(SearchDisposition.Unsupported, "ResourceBudgetOutsideSupportedRange");
+            runOptions = runOptions with
+            {
+                WorkerCount = Math.Min(runOptions.WorkerCount, resources.ResolveCpuWorkers(Environment.ProcessorCount))
+            };
+        }
         if (!profile.TryCanonicalizeSeed(runOptions.StartSeed, out string canonicalStart, out string seedIssue))
             return SearchExecutionCompileResult.Rejected(SearchDisposition.Unsupported, "InvalidStartSeed:" + seedIssue);
 

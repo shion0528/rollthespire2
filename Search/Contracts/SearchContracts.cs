@@ -766,7 +766,16 @@ public sealed record SearchRunOptions(
     int TargetMatchCount,
     int WorkerCount,
     bool IncludeDiagnostics = true,
-    bool SkipExactValidation = false);
+    bool SkipExactValidation = false)
+{
+    public SearchResourceBudget? Resources { get; init; }
+    private SearchOptimizationSettings _optimizations = SearchOptimizationSettings.AllEnabled;
+    public SearchOptimizationSettings Optimizations
+    {
+        get => _optimizations;
+        init => _optimizations = value ?? SearchOptimizationSettings.AllEnabled;
+    }
+}
 
 public sealed record ExactSearchExecutionRequest(
     CompiledSearch CompiledSearch,
@@ -778,6 +787,7 @@ public sealed record ExactSearchExecutionRequest(
     string SnapshotFingerprint)
 {
     internal IReadOnlyList<RolltheSpire2.Core.Neow.NeowChoiceResult>? PartyOpeningChoices { get; init; }
+    internal RolltheSpire2.Core.Rewards.PreparedCombatRewardPools? PreparedRewardPools { get; init; }
     public RuntimeProfileId ProfileId => CompiledSearch.Context.ProfileId;
     public ModelKey CharacterKey => CompiledSearch.Context.CharacterKey;
     public int Ascension => CompiledSearch.Context.Ascension;

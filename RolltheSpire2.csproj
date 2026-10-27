@@ -1,98 +1,122 @@
-<Project Sdk="Godot.NET.Sdk/4.5.1" InitialTargets="ValidateSts2ReferenceDir">
-  <Import Project="Sts2PathDiscovery.props" />
-
-  <PropertyGroup>
-    <TargetFramework>net9.0</TargetFramework>
-    <AssemblyName>RolltheSpire2</AssemblyName>
-    <RootNamespace>RolltheSpire2</RootNamespace>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
-    <Version>1.3.5</Version>
-    <AssemblyVersion>1.3.5.0</AssemblyVersion>
-    <FileVersion>1.3.5.0</FileVersion>
-    <InformationalVersion>1.3.5+$(Configuration)</InformationalVersion>
-    <NoWarn>$(NoWarn);MSB3270;STS002</NoWarn>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <Reference Include="0Harmony">
-      <HintPath>$(Sts2ReferenceDir)/0Harmony.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="sts2">
-      <HintPath>$(Sts2ReferenceDir)/sts2.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-  </ItemGroup>
-
-  <ItemGroup>
-    <Compile Remove="tests\**\*.cs" />
-    <Compile Remove="tools\**\*.cs" />
-    <Compile Remove=".build-evidence\**\*.cs" />
-    <None Include="RolltheSpire2.json" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="project.godot" />
-    <EmbeddedResource Include="Localization\rt2_ui_legacy\*.json"
-                      LogicalName="RolltheSpire2.Localization.rt2_ui_legacy.%(Filename)%(Extension)" />
-    <EmbeddedResource Include="Localization\rt2_ui_v13\*.json"
-                      LogicalName="RolltheSpire2.Localization.rt2_ui_v13.%(Filename)%(Extension)" />
-    <EmbeddedResource Include="Localization\game_content\*.json"
-                      LogicalName="RolltheSpire2.Localization.game_content.%(Filename)%(Extension)" />
-    <EmbeddedResource Include="DeveloperNotes\*.json" WithCulture="false"
-                      LogicalName="RolltheSpire2.DeveloperNotes.%(Filename)%(Extension)" />
-    <EmbeddedResource Include="Encyclopedia\*.md"
-                      LogicalName="RolltheSpire2.Encyclopedia.%(Filename)%(Extension)" />
-    <EmbeddedResource Include="OfficialPresets\*.json"
-                      LogicalName="RolltheSpire2.OfficialPresets.%(Filename)%(Extension)" />
-    <EmbeddedResource Include="DeveloperSeeds\*.json"
-                      LogicalName="RolltheSpire2.DeveloperSeeds.%(Filename)%(Extension)" />
-    <EmbeddedResource Include="Search\Selectivity\MapEvidence\*.hist.gz" LogicalName="RolltheSpire2.MapEvidence.%(Filename)%(Extension)" />
-    <EmbeddedResource Include="Search\Selectivity\MapEvidence\*.signatures.gz" LogicalName="RolltheSpire2.MapEvidence.%(Filename)%(Extension)" />
-    <EmbeddedResource Include="Search\FamilyExecution\Shaders\*.glsl"
-                      LogicalName="RolltheSpire2.Search.FamilyExecution.Shaders.%(Filename)%(Extension)" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <AssemblyMetadata Include="Rt2BuildIdentity" Value="RolltheSpire2-1.3.5-Production" />
-    <AssemblyMetadata Include="Rt2CompatibilityTarget" Value="Beta110-0.110.1-AuditedExact_Beta111-0.111.0-AcceptedCompatible-Modern110Semantic" />
-    <AssemblyMetadata Include="Rt2BuildConfiguration" Value="$(Configuration)" />
-  </ItemGroup>
-
-  <Target Name="ValidateSts2ReferenceDir">
-    <Message Importance="high"
-             Condition="Exists('$(Sts2ReferenceDir)/sts2.dll') and Exists('$(Sts2ReferenceDir)/0Harmony.dll')"
-             Text="RT2 path discovery source=$(Sts2PathDiscoverySource) gameRoot=$(Sts2Path) referenceDir=$(Sts2ReferenceDir) modsDir=$(Rt2ModsDir) modsSource=$(Rt2ModsDiscoverySource)" />
-    <Error
-      Condition="'$(Sts2ReferenceDir)' == ''"
-      Text="Could not locate the Slay the Spire 2 runtime assemblies.&#xA;&#xA;Expected:&#xA;&lt;folder&gt;\sts2.dll&#xA;&lt;folder&gt;\0Harmony.dll&#xA;&#xA;Automatically checked: $(_Rt2CheckedReferenceDirs)&#xA;&#xA;Override with:&#xA;-p:Sts2ReferenceDir=&lt;folder&gt;&#xA;or STS2_REFERENCE_DIR&#xA;or local.props" />
-    <Error
-      Condition="'$(Sts2ReferenceDir)' != '' and (!Exists('$(Sts2ReferenceDir)/sts2.dll') or !Exists('$(Sts2ReferenceDir)/0Harmony.dll'))"
-      Text="Could not locate the Slay the Spire 2 runtime assemblies.&#xA;&#xA;Checked: $(Sts2ReferenceDir)&#xA;&#xA;Expected:&#xA;$(Sts2ReferenceDir)/sts2.dll&#xA;$(Sts2ReferenceDir)/0Harmony.dll&#xA;&#xA;Override with:&#xA;-p:Sts2ReferenceDir=&lt;folder&gt;&#xA;or STS2_REFERENCE_DIR&#xA;or local.props" />
-  </Target>
-
-  <Target Name="ReportBuildIdentity" BeforeTargets="CoreCompile">
-    <Message Importance="high" Text="RT2 $(Version) build configuration=$(Configuration) targetFramework=$(TargetFramework) referenceDir=$(Sts2ReferenceDir) pathSource=$(Sts2PathDiscoverySource) modsDir=$(Rt2ModsDir)" />
-  </Target>
-
-  <Target Name="WriteBuildOutputEvidence" AfterTargets="Build">
-    <PropertyGroup>
-      <Rt2ResolvedBuildEvidenceDir Condition="'$(Rt2BuildEvidenceDir)' != ''">$(Rt2BuildEvidenceDir)</Rt2ResolvedBuildEvidenceDir>
-      <Rt2ResolvedBuildEvidenceDir Condition="'$(Rt2ResolvedBuildEvidenceDir)' == ''">$(MSBuildProjectDirectory)\.build-evidence</Rt2ResolvedBuildEvidenceDir>
-    </PropertyGroup>
-    <MakeDir Directories="$(Rt2ResolvedBuildEvidenceDir)" />
-    <WriteLinesToFile File="$(Rt2ResolvedBuildEvidenceDir)\$(Configuration).targetpath.txt"
-                      Lines="$(TargetPath)"
-                      Overwrite="true"
-                      Encoding="UTF-8" />
-    <Message Importance="high" Text="RT2 build target evidence configuration=$(Configuration) targetPath=$(TargetPath) evidenceDir=$(Rt2ResolvedBuildEvidenceDir)" />
-  </Target>
-
-  <Target Name="CopyModToMods" AfterTargets="Build" Condition="'$(Rt2ModsDir)' != ''">
-    <PropertyGroup>
-      <Rt2InstallDir>$(Rt2ModsDir)/RolltheSpire2</Rt2InstallDir>
-    </PropertyGroup>
-    <MakeDir Directories="$(Rt2InstallDir)" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(Rt2InstallDir)" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\RolltheSpire2.json" DestinationFolder="$(Rt2InstallDir)" />
-  </Target>
-</Project>
+<Project InitialTargets="ValidateSts2ReferenceDir">
+  <!-- Set restore/intermediate isolation before the SDK imports NuGet props. -->
+  <PropertyGroup>
+    <EnableGpuProfiling Condition="'$(EnableGpuProfiling)' == ''">false</EnableGpuProfiling>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(EnableGpuProfiling)' == 'true'">
+    <Configuration Condition="'$(Configuration)' == ''">Debug</Configuration>
+    <BaseIntermediateOutputPath>$(MSBuildProjectDirectory)\.build-evidence\gpu-profiling\obj\</BaseIntermediateOutputPath>
+    <IntermediateOutputPath>$(BaseIntermediateOutputPath)$(Configuration)\</IntermediateOutputPath>
+    <MSBuildProjectExtensionsPath>$(BaseIntermediateOutputPath)</MSBuildProjectExtensionsPath>
+  </PropertyGroup>
+  <Import Project="Sdk.props" Sdk="Godot.NET.Sdk" Version="4.5.1" />
+  <PropertyGroup Condition="'$(EnableGpuProfiling)' == 'true'">
+    <BaseOutputPath>$(MSBuildProjectDirectory)\.build-evidence\gpu-profiling\bin\</BaseOutputPath>
+    <OutputPath>$(BaseOutputPath)$(Configuration)\</OutputPath>
+    <DefineConstants>$(DefineConstants);RT2_GPU_PROFILING</DefineConstants>
+  </PropertyGroup>
+  <Import Project="Sts2PathDiscovery.props" />
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <AssemblyName>RolltheSpire2</AssemblyName>
+    <RootNamespace>RolltheSpire2</RootNamespace>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <Version>1.3.5-resource.17</Version>
+    <AssemblyVersion>1.3.5.17</AssemblyVersion>
+    <FileVersion>1.3.5.17</FileVersion>
+    <InformationalVersion>1.3.5-resource.17+$(Configuration)</InformationalVersion>
+    <NoWarn>$(NoWarn);MSB3270;STS002</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="0Harmony">
+      <HintPath>$(Sts2ReferenceDir)/0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="sts2">
+      <HintPath>$(Sts2ReferenceDir)/sts2.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(EnableGpuProfiling)' != 'true'">
+    <Compile Remove="Diagnostics\GpuProfiling\**\*.cs" />
+    <EmbeddedResource Remove="Diagnostics\GpuProfiling\**\*" />
+    <None Remove="Diagnostics\GpuProfiling\**\*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="tests\**\*.cs" />
+    <Compile Remove="tools\**\*.cs" />
+    <Compile Remove=".build-evidence\**\*.cs" />
+    <None Include="RolltheSpire2.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="project.godot" />
+    <EmbeddedResource Include="Localization\rt2_ui_legacy\*.json"
+                      LogicalName="RolltheSpire2.Localization.rt2_ui_legacy.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Localization\rt2_ui_v13\*.json"
+                      LogicalName="RolltheSpire2.Localization.rt2_ui_v13.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Localization\game_content\*.json"
+                      LogicalName="RolltheSpire2.Localization.game_content.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="DeveloperNotes\*.json" WithCulture="false"
+                      LogicalName="RolltheSpire2.DeveloperNotes.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Encyclopedia\*.md"
+                      LogicalName="RolltheSpire2.Encyclopedia.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="OfficialPresets\*.json"
+                      LogicalName="RolltheSpire2.OfficialPresets.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="DeveloperSeeds\*.json"
+                      LogicalName="RolltheSpire2.DeveloperSeeds.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Search\Selectivity\MapEvidence\*.hist.gz" LogicalName="RolltheSpire2.MapEvidence.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Search\Selectivity\MapEvidence\*.signatures.gz" LogicalName="RolltheSpire2.MapEvidence.%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Search\FamilyExecution\Shaders\*.glsl"
+                      LogicalName="RolltheSpire2.Search.FamilyExecution.Shaders.%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="Rt2BuildIdentity" Value="RolltheSpire2-1.3.5-resource.17-LocalModified" />
+    <AssemblyMetadata Include="Rt2CompatibilityTarget" Value="Beta110-0.110.1-AuditedExact_Beta111-0.111.0-AcceptedCompatible-Modern110Semantic" />
+    <AssemblyMetadata Include="Rt2BuildConfiguration" Value="$(Configuration)" />
+  </ItemGroup>
+
+  <Target Name="ValidateSts2ReferenceDir">
+    <Message Importance="high"
+             Condition="Exists('$(Sts2ReferenceDir)/sts2.dll') and Exists('$(Sts2ReferenceDir)/0Harmony.dll')"
+             Text="RT2 path discovery source=$(Sts2PathDiscoverySource) gameRoot=$(Sts2Path) referenceDir=$(Sts2ReferenceDir) modsDir=$(Rt2ModsDir) modsSource=$(Rt2ModsDiscoverySource)" />
+    <Error
+      Condition="'$(Sts2ReferenceDir)' == ''"
+      Text="Could not locate the Slay the Spire 2 runtime assemblies.&#xA;&#xA;Expected:&#xA;&lt;folder&gt;\sts2.dll&#xA;&lt;folder&gt;\0Harmony.dll&#xA;&#xA;Automatically checked: $(_Rt2CheckedReferenceDirs)&#xA;&#xA;Override with:&#xA;-p:Sts2ReferenceDir=&lt;folder&gt;&#xA;or STS2_REFERENCE_DIR&#xA;or local.props" />
+    <Error
+      Condition="'$(Sts2ReferenceDir)' != '' and (!Exists('$(Sts2ReferenceDir)/sts2.dll') or !Exists('$(Sts2ReferenceDir)/0Harmony.dll'))"
+      Text="Could not locate the Slay the Spire 2 runtime assemblies.&#xA;&#xA;Checked: $(Sts2ReferenceDir)&#xA;&#xA;Expected:&#xA;$(Sts2ReferenceDir)/sts2.dll&#xA;$(Sts2ReferenceDir)/0Harmony.dll&#xA;&#xA;Override with:&#xA;-p:Sts2ReferenceDir=&lt;folder&gt;&#xA;or STS2_REFERENCE_DIR&#xA;or local.props" />
+  </Target>
+
+  <Target Name="ReportBuildIdentity" BeforeTargets="CoreCompile">
+    <Message Importance="high" Text="RT2 $(Version) build configuration=$(Configuration) targetFramework=$(TargetFramework) referenceDir=$(Sts2ReferenceDir) pathSource=$(Sts2PathDiscoverySource) modsDir=$(Rt2ModsDir)" />
+  </Target>
+
+  <Target Name="WriteBuildOutputEvidence" AfterTargets="Build">
+    <PropertyGroup>
+      <Rt2ResolvedBuildEvidenceDir Condition="'$(Rt2BuildEvidenceDir)' != ''">$(Rt2BuildEvidenceDir)</Rt2ResolvedBuildEvidenceDir>
+      <Rt2ResolvedBuildEvidenceDir Condition="'$(Rt2ResolvedBuildEvidenceDir)' == '' and '$(EnableGpuProfiling)' == 'true'">$(MSBuildProjectDirectory)\.build-evidence\gpu-profiling</Rt2ResolvedBuildEvidenceDir>
+      <Rt2ResolvedBuildEvidenceDir Condition="'$(Rt2ResolvedBuildEvidenceDir)' == ''">$(MSBuildProjectDirectory)\.build-evidence</Rt2ResolvedBuildEvidenceDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(Rt2ResolvedBuildEvidenceDir)" />
+    <WriteLinesToFile File="$(Rt2ResolvedBuildEvidenceDir)\$(Configuration).targetpath.txt"
+                      Lines="$(TargetPath)"
+                      Overwrite="true"
+                      Encoding="UTF-8" />
+    <Message Importance="high" Text="RT2 build target evidence configuration=$(Configuration) targetPath=$(TargetPath) evidenceDir=$(Rt2ResolvedBuildEvidenceDir)" />
+  </Target>
+
+  <Target Name="CopyModToMods" AfterTargets="Build" Condition="'$(Rt2ModsDir)' != '' and '$(EnableGpuProfiling)' != 'true'">
+    <PropertyGroup>
+      <Rt2InstallDir>$(Rt2ModsDir)/RolltheSpire2</Rt2InstallDir>
+    </PropertyGroup>
+    <MakeDir Directories="$(Rt2InstallDir)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(Rt2InstallDir)" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\RolltheSpire2.json" DestinationFolder="$(Rt2InstallDir)" />
+  </Target>
+  <Import Project="Sdk.targets" Sdk="Godot.NET.Sdk" Version="4.5.1" />
+</Project>

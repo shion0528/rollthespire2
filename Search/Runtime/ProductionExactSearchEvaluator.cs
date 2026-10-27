@@ -1,6 +1,7 @@
 using RolltheSpire2.Core.Authority;
 using RolltheSpire2.Compatibility;
 using RolltheSpire2.Core.Prediction;
+using RolltheSpire2.Core.Prediction.Profiles;
 using RolltheSpire2.Core.Effects;
 using RolltheSpire2.Core.Identity;
 using RolltheSpire2.Core.Rewards;
@@ -25,6 +26,14 @@ internal sealed record ProductionExactSearchResult(
 /// </summary>
 internal static class ProductionExactSearchEvaluator
 {
+    internal const string NeowOpeningReuseRevision = Beta111NeowOpeningProof.Revision;
+
+    internal static bool CanReuseNeowOpening(ExactSearchExecutionRequest plan) =>
+        plan.RunOptions.Optimizations.CostOrderedFilters && plan.ProfileId == RuntimeProfileId.Beta111 &&
+        plan.Authority.PlayersCount == 1 && plan.Authority.PlayerSlotIndex == 0 &&
+        plan.CompiledSearch.Context.Party is null && plan.PartyOpeningChoices is null &&
+        plan.Evaluation.RequiresNormalCombatRewardDomain;
+
     internal static ProductionExactSearchResult Evaluate(
         SearchExecutionRequest legacyPlan,
         TrustedRootHashInput input) => EvaluateLegacy(legacyPlan, input);
@@ -49,8 +58,23 @@ internal static class ProductionExactSearchEvaluator
 
     internal static ProductionExactSearchResult Evaluate(
         ExactSearchExecutionRequest plan,
-        TrustedRootHashInput input, CancellationToken cancellationToken)
+        TrustedRootHashInput input, CancellationToken cancellationToken) =>
+        Evaluate(plan, input, cancellationToken, forceFullWorldProjection: false);
+
+    // A full projection remains available for diagnostics and same-flag
+    // regression/performance comparisons. It can only add work, never weaken
+    // the query-demand admission proof or bypass an Exact predicate.
+    internal static ProductionExactSearchResult Evaluate(
+        ExactSearchExecutionRequest plan,
+        TrustedRootHashInput input, CancellationToken cancellationToken, bool forceFullWorldProjection)
+        => Evaluate(plan, input, cancellationToken, forceFullWorldProjection, forceRecomputeOpening: false);
+
+    // Same-DLL diagnostic control only; ordinary production always uses false.
+    internal static ProductionExactSearchResult Evaluate(
+        ExactSearchExecutionRequest plan,
+        TrustedRootHashInput input, CancellationToken cancellationToken, bool forceFullWorldProjection, bool forceRecomputeOpening)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (plan.CompiledSearch.Context.Party is not null) return EvaluatePartyInitial(plan, input, cancellationToken);
         if ((plan.CompiledSearch.NormalizedQuery.TransformationAggregate is null) != (plan.Evaluation.TransformationAggregate is null))
             throw new InvalidOperationException("TransformationAggregate.MissingExactObligation");
@@ -158,8 +182,16 @@ internal static class ProductionExactSearchEvaluator
         cheapRequest = cheapRequest!.WithComplexBonesDeckInteractions(
             plan.CompiledSearch.RequiresComplexBonesDeckInteractionEvaluation);
         cheapRequest.PartyOpeningChoices = plan.PartyOpeningChoices;
-        SeedPredictionDocument cheapDocument = RuntimeProfileRegistry.PredictFromRootHash(plan.Detection, cheapRequest, input);
+        cheapRequest.WorldProjection = forceFullWorldProjection
+            ? Core.World.WorldPredictionProjection.All : ExactWorldProjectionPolicy.Resolve(plan);
+        cancellationToken.ThrowIfCancellationRequested();
+        Beta111NeowOpeningProof? opening = null;
+        bool captureOpening = !forceRecomputeOpening && CanReuseNeowOpening(plan);
+        SeedPredictionDocument cheapDocument = captureOpening
+            ? RuntimeProfileRegistry.PredictFromRootHashCapturingOpening(plan.Detection, cheapRequest, input, out opening)
+            : RuntimeProfileRegistry.PredictFromRootHash(plan.Detection, cheapRequest, input);
         ThrowIfPredictionFailed(cheapDocument);
+        cancellationToken.ThrowIfCancellationRequested();
         SearchQueryEvaluation cheapEvaluation = ProductionQueryValidator.EvaluateCheap(plan, cheapDocument, authority);
         cheapEvaluation = MergeCanonicalGlobalEvidence(cheapEvaluation, canonicalEvaluation);
         if (cheapEvaluation.Disposition != SearchDisposition.Match || !plan.Evaluation.RequiresNormalCombatRewardDomain)
@@ -204,8 +236,13 @@ internal static class ProductionExactSearchEvaluator
         rewardRequest = rewardRequest!.WithComplexBonesDeckInteractions(
             plan.CompiledSearch.RequiresComplexBonesDeckInteractionEvaluation);
         rewardRequest.PartyOpeningChoices = plan.PartyOpeningChoices;
-        SeedPredictionDocument rewardDocument = RuntimeProfileRegistry.PredictFromRootHash(plan.Detection, rewardRequest, input);
+        rewardRequest.PreparedRewardPools = plan.PreparedRewardPools;
+        cancellationToken.ThrowIfCancellationRequested();
+        SeedPredictionDocument rewardDocument = opening is not null
+            ? RuntimeProfileRegistry.PredictFromRootHashReusingOpening(plan.Detection, rewardRequest, input, opening)
+            : RuntimeProfileRegistry.PredictFromRootHash(plan.Detection, rewardRequest, input);
         ThrowIfPredictionFailed(rewardDocument);
+        cancellationToken.ThrowIfCancellationRequested();
         SearchQueryEvaluation evaluation = ProductionQueryValidator.EvaluateRewards(plan, rewardDocument, cheapEvaluation);
         return new ProductionExactSearchResult(
             rewardRequest,

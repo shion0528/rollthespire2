@@ -203,7 +203,8 @@ public sealed class Beta110PredictionProfile : ISeedPredictionProfile
                     choices,
                     request.Authority.EffectAuthority,
                     request.Authority.WorldAuthority,
-                    request.CombatRewardProjectionRequest)
+                    request.CombatRewardProjectionRequest,
+                    request.PreparedRewardPools)
                 : null;
 
         return SeedPredictionDocumentFactory.Create(

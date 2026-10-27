@@ -11,7 +11,7 @@ internal readonly record struct NeowFamilyGpuMetrics(int Processed, int Survivor
 
 // Session-resident resources on the existing Family GPU owner. Host transport,
 // header validation and canonicalization follow the accepted R executor donor.
-internal sealed class NeowFamilyGpuExecutor : IDisposable
+internal sealed partial class NeowFamilyGpuExecutor : IDisposable
 {
     internal const int Capacity = FamilyPhysicalExecutionDefaults.DefaultCandidateBatchSize;
     // Full-capacity Compact transport prevents high-survival upstream N/S from
@@ -20,6 +20,26 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
     private readonly List<Rid> _owned = new();
     private readonly Rid _meta, _header, _input, _output, _projectionMetadata;
     private Rid _pipeline, _uniforms;
+    private Rid _dispatchArguments, _dispatchArgumentsPipeline, _dispatchArgumentsUniforms;
+    private NeowFamilyGpuExecutor? _secondWindow;
+    private FamilyGpuComputeUtility.ShaderReuse? _windowShaderReuse;
+    private Rid _headerBank;
+    private bool _lastDenseWindowWasPaired;
+    private bool _lastDenseWindowWasSequentialFallback, _doubleWindowDisabled;
+    private readonly Action? _beforeDoubleAllocation;
+    private readonly bool _requestIndirectStaging;
+    private readonly bool _requestDoubleWindowBatching;
+    private readonly bool _legacyLeafyGate, _requestPreSubmitHeaderReadback;
+    private readonly bool _usePrefixHashCache;
+    private Rid _prefixHashTable;
+    private readonly bool _requestSharedPrefixCache;
+    private SharedVisibleSeedGpuCache? _sharedPrefixCache;
+    private SharedVisibleSeedGpuCache? _sharedDensePrefixCache;
+    private int _sharedDensePrefixBinding = -1;
+    private int _sharedPrefixBinding = -1;
+    private readonly FamilyGpuHeaderReadback _headerReadback;
+    private readonly NeowSparsePayloadReadback _sparsePayloadReadback;
+    private string _stagedDispatchRevision;
     private readonly Rid[] _buffers;
     private Rid[]? _stagedBuffers;
     private readonly NeowFamilyGpuPlan _plan;
@@ -27,6 +47,7 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
     private readonly string? _partySource;
     private readonly int _capsulePhysicalMode;
     private readonly List<(Rid Pipeline, Rid Uniforms)> _stages = new();
+    private bool _stagedModulesReady;
     private readonly int _owner = System.Environment.CurrentManagedThreadId;
     private readonly uint _tag;
     private readonly bool _bonesArcane;
@@ -38,12 +59,73 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
     private readonly bool _tracePrivate = NcPhysicalExperiment.Mode.Length != 0 || PrivateOrdinalSelection.IsRequested || NwaePhysicalExperiment.Mode.Length != 0;
     internal double SetupMs { get; private set; }
     internal string Device { get; }
+    internal const string IndirectStagedRevision = "GpuCountedIndirect.20261021.v1";
+    internal const string DirectStagedRevision = "CapacityDirectControl.20261021.v1";
+    internal const string DirectFallbackStagedRevision = "CapacityDirectFallback.20261021.v1";
+    // The measured try query favors cached prefixes with capacity dispatch.
+    // Counted dispatch remains an explicit developer comparison, never default.
+    internal static bool RequestIndirectStaging =>
+        System.Environment.GetEnvironmentVariable("RT2_NEOW_INDIRECT_DISPATCH") == "1" &&
+        System.Environment.GetEnvironmentVariable("RT2_NEOW_DIRECT_DISPATCH") != "1";
+    internal static string RequestedStagedDispatchRevision => RequestIndirectStaging ? IndirectStagedRevision : DirectStagedRevision;
+    internal static string RequestedHeaderReadbackRevision => FamilyGpuHeaderReadback.RequestedRevision + "." +
+        (FamilyGpuHeaderReadback.Requested ? NeowSparsePayloadReadback.QueuedRevision : NeowSparsePayloadReadback.SynchronousRevision);
+    internal string HeaderReadbackRevision => _headerReadback.Revision + "." +
+        (_sparsePayloadReadback?.Revision ?? NeowSparsePayloadReadback.SynchronousRevision) +
+        (_lastDenseWindowWasPaired && _secondWindow is not null &&
+            _secondWindow._sparsePayloadReadback.Revision != _sparsePayloadReadback?.Revision
+            ? ".SecondPayload." + _secondWindow._sparsePayloadReadback.Revision : "");
+    internal long LastSparsePayloadPrefetchBytes => _sparsePayloadReadback.LastPrefetchBytes;
+    internal const string LegacyLeafyGateRevision = "LeafyGateLegacy.20261021.v1";
+    internal const string OptimizedLeafyGateRevision = "LeafyGateLazyFirstDraw.20261021.v1";
+    internal static bool RequestLegacyLeafyGate => !SearchOptimizationScope.Current.LeafyLazyInitialization ||
+        System.Environment.GetEnvironmentVariable("RT2_NEOW_LEGACY_LEAFY_GATE") == "1";
+    internal static string RequestedLeafyGateRevision => RequestLegacyLeafyGate ? LegacyLeafyGateRevision : OptimizedLeafyGateRevision;
+    internal string LeafyGateRevision => _legacyLeafyGate ? LegacyLeafyGateRevision : OptimizedLeafyGateRevision;
+    internal const string PrefixHashCacheRevision = "PrefixHashBlock34Pow4.20261021.v1";
+    internal const string LegacyPrefixHashRevision = "VisibleSeedHashLegacy.20261021.v1";
+    internal static bool RequestPrefixHashCache => SearchOptimizationScope.Current.PrefixCache &&
+        System.Environment.GetEnvironmentVariable("RT2_NEOW_LEGACY_PREFIX_HASH") != "1";
+    internal static string RequestedPrefixHashRevision => RequestPrefixHashCache ? PrefixHashCacheRevision : LegacyPrefixHashRevision;
+    internal bool UsesPrefixHashCache => _usePrefixHashCache;
+    internal string PrefixHashRevision => _usePrefixHashCache ? PrefixHashCacheRevision : LegacyPrefixHashRevision;
+    internal bool UsesSharedPrefixHashCache => _sharedPrefixCache is not null;
+    internal int SharedPrefixHashBinding => _sharedPrefixBinding;
+    internal string? SharedPrefixHashRevisionFor(bool compactAbi1Input) =>
+        (compactAbi1Input || _privateInput || !_plan.UsesStagedDense
+            ? _sharedPrefixCache : _sharedDensePrefixCache) is not null
+            ? SharedVisibleSeedGpuCache.Revision : null;
+    internal bool UsesSharedDensePrefixHashCache => _sharedDensePrefixCache is not null;
+    internal int SharedDensePrefixHashBinding => _sharedDensePrefixBinding;
+    internal string StagedDispatchRevision => _lastDenseWindowWasPaired && _secondWindow is not null &&
+        _secondWindow._stagedDispatchRevision != _stagedDispatchRevision
+            ? _stagedDispatchRevision + ".Second." + _secondWindow._stagedDispatchRevision : _stagedDispatchRevision;
+    internal bool UsesIndirectStaging => _dispatchArguments.IsValid;
+    internal const int DenseWindowBatchCapacity = Capacity * 2;
+    internal const string SingleWindowRevision = "SingleWindowHeader.20261021.v1";
+    internal const string DoubleWindowRevision = "DoubleWindowHeaderBank.20261021.v1";
+    internal const string SequentialWindowFallbackRevision = "SequentialWindowAllocationFallback.20261021.v1";
+    internal static bool RequestDoubleWindowBatching => SearchOptimizationScope.Current.DoubleWindowBatching &&
+        System.Environment.GetEnvironmentVariable("RT2_NEOW_SINGLE_WINDOW") != "1";
+    internal string WindowTransportRevision => _lastDenseWindowWasPaired ? DoubleWindowRevision :
+        _lastDenseWindowWasSequentialFallback ? SequentialWindowFallbackRevision : SingleWindowRevision;
+    internal bool SupportsDenseWindowBatching => _requestDoubleWindowBatching && !_privateInput && !_privateOutput && _composite is null &&
+        _partySource is null && !_plan.IsMultiplayer && _bonesKMode == 0 && _capsulePhysicalMode == 0 &&
+        _plan.UsesStagedDense && _plan.UsesLeafyPreGate;
     internal const long WorkspaceBytes = (long)Capacity * sizeof(uint) * 2;
     internal long ResidentBytes => WorkspaceBytes + (_stagedBuffers is null ? 0 :
-        (long)NeowFamilyGpuPlan.CurseCapacity * 12 + (long)NeowFamilyGpuPlan.PairCapacity * 48);
+        (long)NeowFamilyGpuPlan.CurseCapacity * 12 + (long)NeowFamilyGpuPlan.PairCapacity * 48) + (UsesIndirectStaging ? 24 : 0) +
+        (_secondWindow?.ResidentBytes ?? 0) + (_headerBank.IsValid ? 64 : 0) + (_prefixHashTable.IsValid ? PrefixHashCache.MaximumTableWords * sizeof(uint) : 0) +
+        (_sharedPrefixCache is null ? 0 : SharedVisibleSeedGpuCache.Bytes) +
+        (_sharedDensePrefixCache is null ? 0 : SharedVisibleSeedGpuCache.Bytes);
     internal static string ShaderSource(int stage = 3, bool capsuleComposite = false, bool leafyPreGate = false,
         bool bonesCapsuleComposite = false, bool bonesArcaneComposite = false, int directNestedMode = 0, int capsulePhysicalMode = 0, int bonesKMode = 0, bool authoredUpgrades = false,
-        bool localResults = true, bool multiplayer = false, int jointTransformMetaOffset = -1) => FamilyGpuComputeUtility.LoadEmbeddedShader(multiplayer ? "NeowParty.comp.glsl" : "NeowSingleplayer.comp.glsl")
+        bool localResults = true, bool multiplayer = false, int jointTransformMetaOffset = -1, bool legacyLeafyGate = false,
+        bool prefixHashCache = false, bool internalFilterOrder = false, string internalFilterOrderSource = "") => FamilyGpuComputeUtility.LoadEmbeddedShader(multiplayer ? "NeowParty.comp.glsl" : "NeowSingleplayer.comp.glsl")
+        .Replace("#define N_INTERNAL_ORDER 0", internalFilterOrder ? "#define N_INTERNAL_ORDER 1" : "#define N_INTERNAL_ORDER 0", StringComparison.Ordinal)
+        .Replace("/*__RT2_N_INTERNAL_FILTER_ORDER__*/", internalFilterOrderSource, StringComparison.Ordinal)
+        .Replace("#define RT2_LEAFY_GATE_LEGACY 0", legacyLeafyGate ? "#define RT2_LEAFY_GATE_LEGACY 1" : "#define RT2_LEAFY_GATE_LEGACY 0", StringComparison.Ordinal)
+        .Replace("#define RT2_PREFIX_HASH_CACHE 0", prefixHashCache ? "#define RT2_PREFIX_HASH_CACHE 1" : "#define RT2_PREFIX_HASH_CACHE 0", StringComparison.Ordinal)
         .Replace("__RT2_N_TRANSFORM_META_OFFSET__", jointTransformMetaOffset.ToString(System.Globalization.CultureInfo.InvariantCulture), StringComparison.Ordinal)
         .Replace("/*__RT2_N_JOINT_TRANSFORMS__*/", jointTransformMetaOffset < 0 ? "" : FamilyGpuComputeUtility.LoadEmbeddedShader("NeowJointTransforms.glsl"), StringComparison.Ordinal)
         .Replace("__RT2_LOCAL_RESULTS__", localResults ? "1" : "0", StringComparison.Ordinal)
@@ -69,8 +151,30 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
             .Replace("__RT2_UP_FRONT_LOW__", ((uint)hash).ToString("x8"), StringComparison.Ordinal)
             .Replace("__RT2_UP_FRONT_HIGH__", ((uint)(hash >> 32)).ToString("x8"), StringComparison.Ordinal);
     }
-    internal NeowFamilyGpuExecutor(RenderingDevice rd, NeowFamilyGpuPlan plan, uint tag, NeowCapsuleComposite? composite = null, PrivateOrdinalBuffer? privateInput = null, PrivateOrdinalBuffer? privateOutput = null, int capsulePhysicalMode = 0, int bonesKMode = 0, uint[]? bonesKMetadata = null, NeowFamilyGpuPlan[]? partyPlans = null)
+    internal NeowFamilyGpuExecutor(RenderingDevice rd, NeowFamilyGpuPlan plan, uint tag, NeowCapsuleComposite? composite = null, PrivateOrdinalBuffer? privateInput = null, PrivateOrdinalBuffer? privateOutput = null, int capsulePhysicalMode = 0, int bonesKMode = 0, uint[]? bonesKMetadata = null, NeowFamilyGpuPlan[]? partyPlans = null, bool? useIndirectStaging = null, Action? beforeDoubleAllocation = null, bool? legacyLeafyGate = null, bool? usePreSubmitHeaderReadback = null, bool? usePrefixHashCache = null,
+        bool? useStaticDrawGates = null,
+        bool? useSharedPrefixCache = null, bool? useInternalFilterOrder = null, bool? useGroupOutput = null,
+        bool? useDoubleWindowBatching = null, NeowStructuralTrialOptions? structuralTrials = null)
     {
+        _requestDoubleWindowBatching = useDoubleWindowBatching ?? RequestDoubleWindowBatching;
+        _useGroupOutput = useGroupOutput ?? RequestGroupOutput;
+        _structuralTrials = (structuralTrials ?? NeowStructuralTrialOptions.Capture()).WithSettings();
+        _beforeDoubleAllocation = beforeDoubleAllocation;
+        _requestSharedPrefixCache = useSharedPrefixCache ?? SharedVisibleSeedGpuCache.Requested;
+        _requestIndirectStaging = useIndirectStaging ?? RequestIndirectStaging;
+        _useStaticDrawGates = useStaticDrawGates ?? RequestStaticDrawGates;
+        _legacyLeafyGate = legacyLeafyGate ?? RequestLegacyLeafyGate;
+        _requestPreSubmitHeaderReadback = usePreSubmitHeaderReadback ?? FamilyGpuHeaderReadback.Requested;
+        _sparsePayloadReadback = new NeowSparsePayloadReadback(rd, _requestPreSubmitHeaderReadback, privateOutput is null);
+        _headerReadback = new FamilyGpuHeaderReadback(rd, _requestPreSubmitHeaderReadback,
+            submitAndSync: family =>
+            {
+                // Both optional prefix captures enter their delivery phase at
+                // the same real submission as the header, never at registration.
+                _sparsePayloadReadback.BeginSubmission();
+                _secondWindow?._sparsePayloadReadback.BeginSubmission();
+                FamilyGpuComputeUtility.SubmitAndSync(rd, family);
+            });
         string? partySource = null;
         if (partyPlans is not null)
         {
@@ -86,6 +190,12 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
         _rd = rd; _tag = tag; _bonesArcane = composite?.UsesBonesArcane == true; _privateInput = privateInput is not null;
         _privateOutput = privateOutput is not null;
         _plan = plan; _composite = composite; _partySource = partySource; _capsulePhysicalMode = capsulePhysicalMode;
+        InitializeInternalFilterOrder(useInternalFilterOrder);
+        InitializeStructuralTrials();
+        _stagedDispatchRevision = _requestIndirectStaging ? IndirectStagedRevision : DirectStagedRevision;
+        _usePrefixHashCache = (usePrefixHashCache ?? RequestPrefixHashCache) && !_privateInput &&
+            composite is null && partySource is null && !plan.IsMultiplayer && plan.UsesStagedDense &&
+            bonesKMode == 0 && capsulePhysicalMode == 0;
         if (_privateInput && ReferenceEquals(privateInput, privateOutput)) throw new ArgumentException("N.PrivateBuffersAlias");
         var timer = Stopwatch.StartNew();
         Rid Buffer(uint[] values, string name) => Add(FamilyGpuComputeUtility.CreateStorageBuffer(rd, FamilyGpuComputeUtility.ToBytesNonEmpty(values), name));
@@ -122,7 +232,14 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
             capsulePhysicalMode: stage == 3 ? _capsulePhysicalMode : 0, bonesKMode: _bonesKMode,
             authoredUpgrades: _plan.HasAuthoredUpgrades,
             localResults: _plan.HasLocalResults || _composite is not null || _bonesKMode != 0, multiplayer: _plan.IsMultiplayer,
-            jointTransformMetaOffset: _plan.JointTransformMetaOffset);
+            jointTransformMetaOffset: _plan.JointTransformMetaOffset, legacyLeafyGate: _legacyLeafyGate,
+            prefixHashCache: stage == 0 && _usePrefixHashCache,
+            internalFilterOrder: (stage is 1 or 4) && InternalFilterOrderEnabled,
+            internalFilterOrderSource: stage == 4 && InternalFilterOrderEnabled
+                ? _structuralPhysical.InternalOrderSource ?? _internalFilterOrderPlan.Source : "");
+        source = ApplyStaticDrawGates(source, stage, _plan, _useStaticDrawGates);
+        source = ApplyGroupOutput(source, stage, GroupOutputEnabledFor(false));
+        source = ApplyStructuralTrials(source, stage);
         if (_privateInput)
         {
             const string ordinalRead = "uint ordinal=batch.values[4u]==0u ? first+lane : input_ordinals.values[first+lane];";
@@ -135,7 +252,7 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
     private void EnsureModules(bool staged)
     {
         if (_initializationFaulted) throw new InvalidOperationException("NFamilyGpuInitializationFaulted");
-        if (staged ? _stages.Count == 3 : _pipeline.IsValid) return;
+        if (staged ? _stagedModulesReady : _pipeline.IsValid) return;
         var timer = Stopwatch.StartNew();
         string name = staged ? "NeowFamilyPreBones0" : "NeowFamilyLocalDonor";
         bool checkpointMetadata = _composite?.UsesBonesCheckpoint == true || _bonesKMode == 2;
@@ -148,14 +265,29 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
                     Add(FamilyGpuComputeUtility.CreateZeroedStorageBuffer(_rd, NeowFamilyGpuPlan.CurseCapacity * 12, "N.CurseSurvivors")),
                     Add(FamilyGpuComputeUtility.CreateZeroedStorageBuffer(_rd, NeowFamilyGpuPlan.PairCapacity * 48, "N.PairSurvivors"))];
                 if (checkpointMetadata) _stagedBuffers = [.._stagedBuffers, _projectionMetadata];
+                if (_usePrefixHashCache)
+                    _prefixHashTable = Add(FamilyGpuComputeUtility.CreateZeroedStorageBuffer(_rd,
+                        PrefixHashCache.MaximumTableWords * sizeof(uint), "N.PrefixHashTable"));
                 for (int stage = 0; stage < 3; stage++)
                 {
                     name = "NeowFamilyPreBones" + stage;
-                    Rid shader = Add(FamilyGpuComputeUtility.CompileShader(_rd, ModuleSource(stage), name));
+                    string source = ModuleSource(stage);
+                    Rid[] stageBuffers = stage == 0 && _usePrefixHashCache ? [.._stagedBuffers, _prefixHashTable] : _stagedBuffers;
+                    if (stage == 0 && !_usePrefixHashCache && (_composite is not null || _partySource is not null || _plan.IsMultiplayer || _bonesKMode != 0 || _capsulePhysicalMode != 0))
+                    {
+                        int binding = stageBuffers.Length;
+                        _sharedDensePrefixCache = SharedVisibleSeedGpuCache.Attach(_rd, _owned,
+                            ref source, ref stageBuffers, "N.Neow.Dense", _requestSharedPrefixCache);
+                        _sharedDensePrefixBinding = _sharedDensePrefixCache is null ? -1 : binding;
+                    }
+                    Rid shader = Add(FamilyGpuComputeUtility.CompileShader(_rd, source, name));
                     Rid pipeline = Add(FamilyGpuComputeUtility.CreateComputePipeline(_rd, shader, name));
                     if (!_rd.ComputePipelineIsValid(pipeline)) throw new InvalidOperationException("NFamilyStagePipelineInvalid:" + name);
-                    _stages.Add((pipeline, Add(FamilyGpuComputeUtility.CreateUniformSet(_rd, shader, _stagedBuffers, name))));
+                    _stages.Add((pipeline, Add(FamilyGpuComputeUtility.CreateUniformSet(_rd, shader, stageBuffers, name))));
                 }
+                if (InternalFilterOrderEnabled) CreateInternalFilterOrderModule(_stagedBuffers);
+                if (_requestIndirectStaging) TryCreateIndirectDispatchModules();
+                _stagedModulesReady = true;
             }
             else
             {
@@ -165,12 +297,20 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
                         Add(FamilyGpuComputeUtility.CreateZeroedStorageBuffer(_rd, 4, "N.UnusedCurseBinding")),
                         Add(FamilyGpuComputeUtility.CreateZeroedStorageBuffer(_rd, 4, "N.UnusedPairBinding")), _projectionMetadata];
                 else if (_composite is not null) buffers = [..buffers, _projectionMetadata];
-                Rid shader = Add(FamilyGpuComputeUtility.CompileShader(_rd, ModuleSource(3), name));
+                string source = ModuleSource(3);
+                int sharedBinding = buffers.Length;
+                _sharedPrefixCache = SharedVisibleSeedGpuCache.Attach(_rd, _owned, ref source, ref buffers,
+                    "N.Neow.Fused", _requestSharedPrefixCache);
+                _sharedPrefixBinding = _sharedPrefixCache is null ? -1 : sharedBinding;
+                Rid shader = Add(FamilyGpuComputeUtility.CompileShader(_rd, source, name));
                 Rid pipeline = Add(FamilyGpuComputeUtility.CreateComputePipeline(_rd, shader, name));
                 if (!_rd.ComputePipelineIsValid(pipeline)) throw new InvalidOperationException("NFamilyGpuPipelineInvalid:" + name);
                 Rid uniforms = Add(FamilyGpuComputeUtility.CreateUniformSet(_rd, shader, buffers, name));
                 _pipeline = pipeline; _uniforms = uniforms;
             }
+            bool prefixActive = staged && _usePrefixHashCache;
+            Bootstrap.RuntimeLog.TryBackgroundInfo($"nGpuModuleReady=true;path={(staged ? "DenseStaged" : "Fused")};prefixHashCache={prefixActive};prefixHashRevision={(prefixActive ? PrefixHashCacheRevision : LegacyPrefixHashRevision)};sharedPrefixHashCache={(staged ? _sharedDensePrefixCache is not null : _sharedPrefixCache is not null)};sharedPrefixBinding={(staged ? _sharedDensePrefixBinding : _sharedPrefixBinding)};stagedDispatchRevision={_stagedDispatchRevision};leafyPreGate={_plan.UsesLeafyPreGate};privateInput={_privateInput};privateOutput={_privateOutput};internalFilterOrder={staged && InternalFilterOrderEnabled};internalFilterOrderRevision={InternalFilterOrderRevisionFor(!staged)};internalFilterOrderDescription={(staged ? InternalFilterOrderDescription : "FusedCanonicalOrder")};internalFilterOrderNicheAdvances={string.Join(',', _internalFilterOrderPlan.NicheAdvances)};{InternalFilterOrderCostEvidence};groupOutput={GroupOutputEnabledFor(!staged)};groupOutputRevision={GroupOutputRevisionFor(!staged)}");
+            Bootstrap.RuntimeLog.TryBackgroundInfo($"nStructuralTrials=true;path={(staged ? "DenseStaged" : "Fused")};poolGateRequested={_structuralTrials.KaleidoscopePoolGate};finalCurseIntervalsRequested={_structuralTrials.FinalCurseIntervals};bonesIdentityOnlyRequested={_structuralTrials.BonesIdentityOnly};poolGate={staged && _structuralPhysical.KaleidoscopePoolGate};finalCurseIntervals={staged && _structuralPhysical.FinalCurseIntervals};bonesIdentityOnly={!staged && _structuralPhysical.BonesIdentityOnly};target0PoolMask={_structuralPhysical.Target0Pools};target1PoolMask={_structuralPhysical.Target1Pools};physicalRevision={StructuralRevisionFor(!staged)};reason={_structuralPhysical.Reason};acceptanceAuthority=CanonicalMatcherAndExactUnchanged;densityIndependenceAssumed=false");
         }
         catch (Exception ex)
         {
@@ -180,6 +320,32 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
             throw failure;
         }
         finally { SetupMs += timer.Elapsed.TotalMilliseconds; }
+    }
+    private void TryCreateIndirectDispatchModules()
+    {
+        // Keep optional resources separate until all bindings are valid. Only
+        // initialization may fall back; a submitted dispatch or invalid result
+        // must retain the existing fail-closed execution behavior.
+        var resources = new List<Rid>();
+        Rid Own(Rid rid) { resources.Add(rid); return rid; }
+        try
+        {
+            Rid arguments = _rd.StorageBufferCreate(24, Array.Empty<byte>(), RenderingDevice.StorageBufferUsage.Indirect);
+            if (!arguments.IsValid) throw new InvalidOperationException("N.IndirectArgumentsBufferUnavailable");
+            Own(arguments);
+            Rid shader = Own(FamilyGpuComputeUtility.CompileShader(_rd,
+                FamilyGpuComputeUtility.LoadEmbeddedShader("NeowDispatchArguments.comp.glsl"), "NeowDispatchArguments"));
+            Rid pipeline = Own(FamilyGpuComputeUtility.CreateComputePipeline(_rd, shader, "NeowDispatchArguments"));
+            Rid uniforms = Own(FamilyGpuComputeUtility.CreateUniformSet(_rd, shader, [_meta, _header, arguments], "NeowDispatchArguments"));
+            _owned.AddRange(resources);
+            _dispatchArguments = arguments; _dispatchArgumentsPipeline = pipeline; _dispatchArgumentsUniforms = uniforms;
+        }
+        catch (Exception ex)
+        {
+            FamilyGpuComputeUtility.CleanupAfterFailure(ex, () => FamilyGpuComputeUtility.FreeAll(_rd, resources), "N.IndirectDispatchInitialization");
+            _stagedDispatchRevision = DirectFallbackStagedRevision;
+            Bootstrap.RuntimeLog.TryBackgroundWarning($"nStagedDispatchFallback=true;revision={_stagedDispatchRevision};reason={ex.GetType().Name}:{ex.Message.Replace(';', ',').Replace('\r', ' ').Replace('\n', ' ')};scope=OptionalInitializationOnly;reference=UnmeasuredDispatchRevision");
+        }
     }
     private uint[] Header() => _bonesKMode != 0 ? [0x4e464d52, 1, 0, 0, 0, _tag, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] : _bonesArcane ? [0x4e464d52, 1, 0, 0, 0, _tag, 0, 0, 0, 0, 0, 0]
         : [0x4e464d52, 1, 0, 0, 0, _tag, 0, 0];
@@ -191,6 +357,8 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
     internal FamilyCandidateSet Execute(FamilyCandidateSet input, CancellationToken token, out NeowFamilyGpuMetrics metrics)
     {
         if (_privateInput || _privateOutput) throw new InvalidOperationException("N.PrivateTransportRequiresPrivateEntry");
+        _lastDenseWindowWasPaired = false;
+        _lastDenseWindowWasSequentialFallback = false;
         return ExecuteCore(input, input.Count, token, out metrics)!;
     }
 
@@ -215,6 +383,7 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
     private FamilyCandidateSet? ExecuteCore(FamilyCandidateSet input, int inputCount, CancellationToken token, out NeowFamilyGpuMetrics metrics)
     {
         AssertOwner(); token.ThrowIfCancellationRequested();
+        _sparsePayloadReadback.AssertReady();
         if (inputCount > Capacity) throw new InvalidOperationException("NFamilyGpuCapacityExceeded");
         bool dense = input.IsDense && !_privateInput;
         bool staged = dense && _plan.UsesStagedDense;
@@ -222,11 +391,44 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
         // Setup is reported separately from batch upload/dispatch costs, including
         // a later transition between public Compact and Dense input.
         if (inputCount > 0) EnsureModules(staged);
+        GpuProfilingBeginBatch(inputCount);
+        try
+        {
+            var recorded = RecordWindow(input, inputCount, staged);
+            using var payload = _sparsePayloadReadback.RegisterRecorded(_output, inputCount, recorded.Groups > 0);
+            double syncedMs = 0;
+            GpuProfilingBeforeSubmit();
+            uint[] header;
+            try
+            {
+                header = _headerReadback.CompleteRecorded(_header, _bonesKMode != 0 ? 16u : _bonesArcane ? 12u : 8u,
+                    recorded.Groups > 0, "N.Neow", () => { syncedMs = recorded.Timer.Elapsed.TotalMilliseconds; GpuProfilingAfterSync(); });
+                payload?.CompleteAfterSync();
+            }
+            catch { _sparsePayloadReadback.MarkFaulted(); throw; }
+            token.ThrowIfCancellationRequested();
+            var result = CompleteWindow(recorded, header, syncedMs, out metrics);
+            GpuProfilingBatchCompleted(metrics);
+            return result;
+        }
+        finally { GpuProfilingEndBatch(); }
+    }
+    private sealed record RecordedWindow(FamilyCandidateSet Input, int InputCount, bool Staged,
+        uint Groups, double UploadedMs, Stopwatch Timer);
+    private RecordedWindow RecordWindow(FamilyCandidateSet input, int inputCount, bool staged)
+    {
+        bool dense = input.IsDense && !_privateInput;
         var timer = Stopwatch.StartNew();
         FamilyGpuComputeUtility.Update(_rd, _meta, [(uint)input.Batch.BatchBase, (uint)(input.Batch.BatchBase >> 32),
             (uint)input.Batch.BatchCandidateCount, (uint)inputCount, dense ? 0u : 1u, Capacity,
             NeowFamilyGpuPlan.CurseCapacity, NeowFamilyGpuPlan.PairCapacity], "NFamilyBatch");
         FamilyGpuComputeUtility.Update(_rd, _header, Header(), "NFamilyHeader");
+        if (staged && InternalFilterOrderEnabled)
+            FamilyGpuComputeUtility.Update(_rd, _output, [0u], "N.InternalFilterCount");
+        if (staged && dense && _usePrefixHashCache && inputCount > 0)
+            FamilyGpuComputeUtility.Update(_rd, _prefixHashTable, PrefixHashCache.BuildTable(input.Batch.BatchBase, inputCount), "N.PrefixHashTable");
+        if (staged && inputCount > 0) _sharedDensePrefixCache?.Refresh(input.Batch);
+        if (!staged) _sharedPrefixCache?.Refresh(input.Batch);
         if (!input.IsDense && !_privateInput) FamilyGpuComputeUtility.Update(_rd, _input,
             input.ExportAbi1().ToArray().Select(x => checked((uint)x)).ToArray(), "NFamilyCompact");
         double uploadedMs = timer.Elapsed.TotalMilliseconds;
@@ -234,15 +436,37 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
         if (groups > 0)
         {
             if (!staged && !_pipeline.IsValid) throw new InvalidOperationException("N.UnboundCompactModule");
+            GpuProfilingWindowBegin();
             long list = _rd.ComputeListBegin();
             if (staged)
             {
                 for (int stage = 0; stage < 3; stage++)
                 {
-                    if (stage > 0) _rd.ComputeListAddBarrier(list);
+                    if (stage > 0)
+                    {
+                        _rd.ComputeListAddBarrier(list);
+                        if (stage == 1 && InternalFilterOrderEnabled)
+                        {
+                            _rd.ComputeListBindComputePipeline(list, _internalFilterOrderPipeline);
+                            _rd.ComputeListBindUniformSet(list, _internalFilterOrderUniforms, 0);
+                            _rd.ComputeListDispatch(list, (uint)(NeowFamilyGpuPlan.CurseCapacity / 512), 1, 1);
+                            _rd.ComputeListAddBarrier(list);
+                        }
+                        if (UsesIndirectStaging)
+                        {
+                            _rd.ComputeListBindComputePipeline(list, _dispatchArgumentsPipeline);
+                            _rd.ComputeListBindUniformSet(list, _dispatchArgumentsUniforms, 0);
+                            _rd.ComputeListDispatch(list, 1, 1, 1);
+                            _rd.ComputeListAddBarrier(list);
+                        }
+                    }
                     _rd.ComputeListBindComputePipeline(list, _stages[stage].Pipeline);
                     _rd.ComputeListBindUniformSet(list, _stages[stage].Uniforms, 0);
-                    _rd.ComputeListDispatch(list, stage == 0 ? groups : (uint)((stage == 1 ? NeowFamilyGpuPlan.CurseCapacity : NeowFamilyGpuPlan.PairCapacity) / 512), 1, 1);
+                    if (stage > 0 && UsesIndirectStaging)
+                        _rd.ComputeListDispatchIndirect(list, _dispatchArguments, (uint)((stage - 1) * 12));
+                    else
+                        _rd.ComputeListDispatch(list, stage == 0 ? groups :
+                            (uint)((stage == 1 ? NeowFamilyGpuPlan.CurseCapacity : NeowFamilyGpuPlan.PairCapacity) / 512), 1, 1);
                 }
             }
             else
@@ -251,11 +475,19 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
                 _rd.ComputeListDispatch(list, groups, 1, 1);
             }
             _rd.ComputeListEnd();
-            FamilyGpuComputeUtility.SubmitAndSync(_rd, "N.Neow");
+            GpuProfilingWindowEnd();
         }
-        token.ThrowIfCancellationRequested();
-        double syncedMs = timer.Elapsed.TotalMilliseconds;
-        uint[] header = FamilyGpuComputeUtility.FromUInt32Bytes(_rd.BufferGetData(_header));
+        return new(input, inputCount, staged, groups, uploadedMs, timer);
+    }
+    private FamilyCandidateSet? CompleteWindow(RecordedWindow recorded, uint[] header, double syncedMs,
+        out NeowFamilyGpuMetrics metrics)
+    {
+        var input = recorded.Input;
+        int inputCount = recorded.InputCount;
+        bool staged = recorded.Staged;
+        uint groups = recorded.Groups;
+        double uploadedMs = recorded.UploadedMs;
+        var timer = recorded.Timer;
         if (header.Length != (_bonesKMode != 0 ? 16 : _bonesArcane ? 12 : 8) || header[0] != 0x4e464d52 || header[1] != 1 || header[5] != _tag ||
             header[3] != 0 || header[4] != inputCount || header[2] > header[4] ||
             (staged && (header[6] > NeowFamilyGpuPlan.CurseCapacity || header[7] > NeowFamilyGpuPlan.PairCapacity || header[7] > header[6])))
@@ -274,14 +506,21 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
         {
             double readyMs=timer.Elapsed.TotalMilliseconds;
             metrics=new(inputCount,checked((int)count),groups,header.Length*4,readyMs,uploadedMs,syncedMs-uploadedMs,
-                readyMs-syncedMs,0,groups==0?0:staged?3:1,header[6],header[7],0,0,0,0,0);
+                readyMs-syncedMs,0,groups==0?0:WindowDispatchCount(staged),header[6],header[7],0,0,0,0,0);
             return null;
         }
         if (_bonesArcane && (header[8] > input.Count || header[9] > header[8] || header[10] > header[9] ||
             header[11] < header[10] || header[11] > 2UL * header[10] || count > header[10]))
             throw new InvalidDataException("NrBonesArcaneCountersInvalid");
+        _sparsePayloadReadback.ObserveValidatedCount(count, inputCount > 0 && groups > 0);
         double payloadStartMs = _bonesArcane ? timer.Elapsed.TotalMilliseconds : 0;
-        uint[] packed = count == 0 ? [] : FamilyGpuComputeUtility.FromUInt32Bytes(_rd.BufferGetData(_output, 0, count * sizeof(uint)));
+        long payloadReadbackBytes = _sparsePayloadReadback.TransferredBytes;
+        if (!_sparsePayloadReadback.TryGetValidatedPrefix(count, out uint[] packed))
+        {
+            // A bounded speculative prefix never truncates a dense result.
+            packed = FamilyGpuComputeUtility.FromUInt32Bytes(_rd.BufferGetData(_output, 0, checked(count * sizeof(uint))), count);
+            payloadReadbackBytes += checked((long)count * sizeof(uint));
+        }
         double readMs = timer.Elapsed.TotalMilliseconds;
         // Solo high-output public boundaries spend far more time comparison-sorting
         // widened ordinals than dispatching. Sort the complete packed permutation
@@ -309,13 +548,167 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
         double validationStart = timer.Elapsed.TotalMilliseconds;
         var result = FamilyCandidateSet.FromSortedAbi1(input.Batch, ordinals);
         double canonicalMs = timer.Elapsed.TotalMilliseconds;
-        metrics = new((int)header[4], ordinals.Length, groups, header.Length * sizeof(uint) + count * sizeof(uint), canonicalMs,
+        metrics = new((int)header[4], ordinals.Length, groups, header.Length * sizeof(uint) + payloadReadbackBytes, canonicalMs,
             uploadedMs, syncedMs - uploadedMs, readMs - syncedMs, canonicalMs - readMs,
-            groups == 0 ? 0 : staged ? 3 : 1, header[6], header[7], _bonesArcane ? header[8] : 0, _bonesArcane ? header[9] : 0,
+            groups == 0 ? 0 : WindowDispatchCount(staged), header[6], header[7], _bonesArcane ? header[8] : 0, _bonesArcane ? header[9] : 0,
             _bonesArcane ? header[10] : 0, _bonesArcane ? header[11] : 0, _bonesArcane && count > 0 ? readMs - payloadStartMs : 0);
         if (_tracePrivate)
             Bootstrap.RuntimeLog.TryBackgroundDetail($"ncStageTiming=true;stage=N;input={inputCount};output={result.Count};dispatches={metrics.Dispatches};uploadMs={uploadedMs};dispatchSyncMs={metrics.DispatchSyncMs};readbackMs={metrics.ReadbackMs};readbackBytes={metrics.ReadbackBytes};widenMs={widenMs};sortMs={sortMs};validationMs={canonicalMs-validationStart};canonicalMs={canonicalMs};packedRadix={packedRadix}");
         return result;
+    }
+
+    internal FamilyCandidateSet ExecuteDenseWindows(FamilyCandidateSet input, CancellationToken token,
+        out NeowFamilyGpuMetrics metrics)
+    {
+        AssertOwner(); token.ThrowIfCancellationRequested();
+        if (!SupportsDenseWindowBatching || !input.IsDense || input.Count > DenseWindowBatchCapacity)
+            throw new InvalidOperationException("N.DoubleWindowScopeOrCapacity");
+        if (input.Count <= Capacity) return Execute(input, token, out metrics);
+        if (!TryPrepareDoubleWindowResources()) return ExecuteSequentialWindows(input, token, out metrics);
+        var second = _secondWindow!;
+        second.AssertOwner();
+        _sparsePayloadReadback.AssertReady(); second._sparsePayloadReadback.AssertReady();
+        _lastDenseWindowWasPaired = true;
+        _lastDenseWindowWasSequentialFallback = false;
+        var left = FamilyCandidateSet.Dense(new SearchBatch(input.Batch.BatchBase, Capacity));
+        var right = FamilyCandidateSet.Dense(new SearchBatch(checked(input.Batch.BatchBase + (ulong)Capacity), input.Count - Capacity));
+        // Both independent workspaces are fully initialized before recording.
+        // Once recording starts, complete submission and synchronization before
+        // observing cancellation or exposing any results to the caller.
+        token.ThrowIfCancellationRequested();
+        GpuProfilingBeginBatch(input.Count);
+        try
+        {
+        var timer = Stopwatch.StartNew();
+        var a = RecordWindow(left, left.Count, true);
+        var b = second.RecordWindow(right, right.Count, true);
+        if (_rd.BufferCopy(_header, _headerBank, 0, 0, 32) != Error.Ok ||
+            _rd.BufferCopy(second._header, _headerBank, 0, 32, 32) != Error.Ok)
+            throw new InvalidOperationException("N.DoubleWindowHeaderCopyFailed");
+        using var payloadA = _sparsePayloadReadback.RegisterRecorded(_output, left.Count, true);
+        using var payloadB = second._sparsePayloadReadback.RegisterRecorded(second._output, right.Count, true);
+        double syncedMs = 0;
+        GpuProfilingBeforeSubmit();
+        uint[] bank;
+        try
+        {
+            bank = _headerReadback.CompleteRecorded(_headerBank, 16, true,
+                "N.Neow.DoubleWindow", () => { syncedMs = timer.Elapsed.TotalMilliseconds; GpuProfilingAfterSync(); });
+            payloadA?.CompleteAfterSync(); payloadB?.CompleteAfterSync();
+        }
+        catch { _sparsePayloadReadback.MarkFaulted(); second._sparsePayloadReadback.MarkFaulted(); throw; }
+        token.ThrowIfCancellationRequested();
+        double bankReadMs = timer.Elapsed.TotalMilliseconds - syncedMs;
+        if (bank.Length != 16) throw new InvalidDataException("N.DoubleWindowHeaderBankInvalid");
+        // Completion retains the original header, payload, bounds and duplicate
+        // validators for each physical window. These local timers only measure
+        // completion work; the returned batch metrics use the shared wall time.
+        var completedA = a with { UploadedMs = 0, Timer = Stopwatch.StartNew() };
+        var resultA = CompleteWindow(completedA, bank[..8], 0, out var am)!;
+        var completedB = b with { UploadedMs = 0, Timer = Stopwatch.StartNew() };
+        var resultB = second.CompleteWindow(completedB, bank[8..], 0, out var bm)!;
+        var result = MergeDenseWindows(input.Batch, resultA, resultB);
+        double canonicalMs = timer.Elapsed.TotalMilliseconds;
+        double readbackMs = bankReadMs + am.ReadbackMs + bm.ReadbackMs;
+        double uploadMs = a.UploadedMs + b.UploadedMs;
+        metrics = new(input.Count, result.Count, checked(a.Groups + b.Groups), am.ReadbackBytes + bm.ReadbackBytes,
+            canonicalMs, uploadMs, syncedMs - uploadMs, readbackMs, Math.Max(0, canonicalMs - syncedMs - readbackMs),
+            am.Dispatches + bm.Dispatches, checked(am.CurseSurvivors + bm.CurseSurvivors), checked(am.PairSurvivors + bm.PairSurvivors),
+            0, 0, 0, 0, 0);
+        GpuProfilingBatchCompleted(metrics);
+        return result;
+        }
+        finally { GpuProfilingEndBatch(); }
+    }
+    private FamilyCandidateSet ExecuteSequentialWindows(FamilyCandidateSet input, CancellationToken token,
+        out NeowFamilyGpuMetrics metrics)
+    {
+        GpuProfilingBeginBatch(input.Count);
+        try
+        {
+        _lastDenseWindowWasPaired = false;
+        _lastDenseWindowWasSequentialFallback = true;
+        var left = FamilyCandidateSet.Dense(new SearchBatch(input.Batch.BatchBase, Capacity));
+        var right = FamilyCandidateSet.Dense(new SearchBatch(checked(input.Batch.BatchBase + (ulong)Capacity), input.Count - Capacity));
+        var timer = Stopwatch.StartNew();
+        // The optional allocation failed before any command was recorded. Each
+        // single-window call fully synchronizes before reusing this workspace.
+        // Neither result escapes until both windows validate and merge.
+        var resultA = ExecuteCore(left, left.Count, token, out var am)!;
+        var resultB = ExecuteCore(right, right.Count, token, out var bm)!;
+        var result = MergeDenseWindows(input.Batch, resultA, resultB);
+        double canonicalMs = timer.Elapsed.TotalMilliseconds;
+        double uploadMs = am.UploadMs + bm.UploadMs;
+        double dispatchMs = am.DispatchSyncMs + bm.DispatchSyncMs;
+        double readbackMs = am.ReadbackMs + bm.ReadbackMs;
+        metrics = new(input.Count, result.Count, checked(am.Groups + bm.Groups), am.ReadbackBytes + bm.ReadbackBytes,
+            canonicalMs, uploadMs, dispatchMs, readbackMs, Math.Max(0, canonicalMs - uploadMs - dispatchMs - readbackMs),
+            am.Dispatches + bm.Dispatches, checked(am.CurseSurvivors + bm.CurseSurvivors), checked(am.PairSurvivors + bm.PairSurvivors),
+            0, 0, 0, 0, 0);
+        GpuProfilingBatchCompleted(metrics);
+        return result;
+        }
+        finally { GpuProfilingEndBatch(); }
+    }
+    private static FamilyCandidateSet MergeDenseWindows(SearchBatch batch, FamilyCandidateSet left, FamilyCandidateSet right)
+    {
+        ulong[] merged = new ulong[checked(left.Count + right.Count)];
+        left.ExportAbi1().Span.CopyTo(merged);
+        var tail = right.ExportAbi1().Span;
+        for (int i = 0; i < tail.Length; i++) merged[left.Count + i] = checked(tail[i] + (ulong)Capacity);
+        return FamilyCandidateSet.FromSortedAbi1(batch, merged);
+    }
+    private bool TryPrepareDoubleWindowResources()
+    {
+        if (_initializationFaulted) throw new InvalidOperationException("NFamilyGpuInitializationFaulted");
+        if (_secondWindow is not null && _headerBank.IsValid) return true;
+        if (_doubleWindowDisabled) return false;
+        double previousSetupMs = SetupMs;
+        var timer = Stopwatch.StartNew();
+        try
+        {
+            _windowShaderReuse ??= new FamilyGpuComputeUtility.ShaderReuse(_rd);
+            using var scope = _windowShaderReuse.Activate();
+            // A failed base initialization frees the base owner's RIDs and is
+            // fatal. It must stay outside the optional-resource fallback catch.
+            EnsureModules(true);
+            NeowFamilyGpuExecutor? candidate = null;
+            Rid bank = default;
+            try
+            {
+                _beforeDoubleAllocation?.Invoke();
+                candidate = new NeowFamilyGpuExecutor(_rd, _plan, _tag, useIndirectStaging: _requestIndirectStaging,
+                    legacyLeafyGate: _legacyLeafyGate, usePreSubmitHeaderReadback: _requestPreSubmitHeaderReadback,
+                    usePrefixHashCache: _usePrefixHashCache,
+                    useStaticDrawGates: _useStaticDrawGates, useSharedPrefixCache: _requestSharedPrefixCache,
+                    useInternalFilterOrder: _requestInternalFilterOrder, useGroupOutput: _useGroupOutput,
+                    useDoubleWindowBatching: _requestDoubleWindowBatching, structuralTrials: _structuralTrials);
+                candidate.EnsureModules(true);
+                bank = FamilyGpuComputeUtility.CreateZeroedStorageBuffer(_rd, 64, "N.DoubleWindowHeaders");
+                Add(bank);
+                _secondWindow = candidate; _headerBank = bank;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                var cleanupFailures = new List<Exception>();
+                if (bank.IsValid)
+                    try { _rd.FreeRid(bank); } catch (Exception cleanup) { cleanupFailures.Add(cleanup); }
+                if (candidate is not null)
+                    try { candidate.Dispose(); } catch (Exception cleanup) { cleanupFailures.Add(cleanup); }
+                // If optional resources cannot be proven released, retain the
+                // original fail-closed behavior instead of reusing the device.
+                if (cleanupFailures.Count != 0 || FamilyGpuComputeUtility.HasInitializationCleanupFailure(ex))
+                {
+                    _initializationFaulted = true;
+                    throw new AggregateException("N.DoubleWindowCleanupFailed", new[] { ex }.Concat(cleanupFailures));
+                }
+                _doubleWindowDisabled = true;
+                Bootstrap.RuntimeLog.TryBackgroundWarning($"nDoubleWindowFallback=true;revision={SequentialWindowFallbackRevision};reason={ex.GetType().Name}:{ex.Message.Replace(';', ',').Replace('\r', ' ').Replace('\n', ' ')};scope=OptionalInitializationOnly;retryAllocation=false;submittedWorkRetried=false");
+                return false;
+            }
+        }
+        finally { SetupMs = previousSetupMs + timer.Elapsed.TotalMilliseconds; }
     }
 
     // Four stable byte passes preserve every uint, including malformed values;
@@ -340,7 +733,22 @@ internal sealed class NeowFamilyGpuExecutor : IDisposable
     }
     public void Dispose()
     {
-        AssertOwner(); _disposed = true;
-        FamilyGpuComputeUtility.FreeAll(_rd, _owned);
+        AssertOwner(); GpuProfilingDispose(); _disposed = true;
+        var failures = new List<Exception>();
+        try { _secondWindow?.Dispose(); } catch (Exception ex) { failures.Add(ex); }
+        try { FamilyGpuComputeUtility.FreeAll(_rd, _owned); } catch (Exception ex) { failures.Add(ex); }
+        try { _windowShaderReuse?.Dispose(); } catch (Exception ex) { failures.Add(ex); }
+        if (failures.Count != 0) throw new AggregateException("N.DisposeFailed", failures);
     }
+
+    // Optional implementations live in Diagnostics/GpuProfiling. Without that
+    // build input, C# removes these declarations and every call entirely.
+    partial void GpuProfilingBeginBatch(int inputCount);
+    partial void GpuProfilingWindowBegin();
+    partial void GpuProfilingWindowEnd();
+    partial void GpuProfilingBeforeSubmit();
+    partial void GpuProfilingAfterSync();
+    partial void GpuProfilingBatchCompleted(NeowFamilyGpuMetrics metrics);
+    partial void GpuProfilingEndBatch();
+    partial void GpuProfilingDispose();
 }

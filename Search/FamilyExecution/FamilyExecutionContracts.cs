@@ -147,6 +147,9 @@ public static class LinearFamilyPipeline
         ArgumentNullException.ThrowIfNull(executionContext);
         ArgumentNullException.ThrowIfNull(families);
 
+        using var optimizationScope = SearchOptimizationScope.Enter(executionContext.Optimizations);
+        using var cpuScope = executionContext.EnterCpuBudget();
+
         FamilyCandidateSet current = FamilyCandidateSet.Dense(observationWindow.Batch);
         foreach (IFamilyInvocation family in families)
         {

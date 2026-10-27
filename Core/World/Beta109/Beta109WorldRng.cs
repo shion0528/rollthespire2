@@ -11,21 +11,26 @@ public sealed class Beta109WorldRng
     private readonly Xoshiro256StarStar _rng;
     private readonly string _streamDomain;
     private readonly List<WorldRngTraceEntry> _trace = new();
+    private readonly bool _captureTrace;
 
-    private Beta109WorldRng(Xoshiro256StarStar rng, string streamDomain)
+    private Beta109WorldRng(Xoshiro256StarStar rng, string streamDomain, bool captureTrace = true)
     {
         _rng = rng;
         _streamDomain = streamDomain;
+        _captureTrace = captureTrace;
     }
 
     public int CallCount => _rng.CallCount;
     public IReadOnlyList<WorldRngTraceEntry> Trace => _trace;
 
     public static Beta109WorldRng CreateNamed(ulong runSeedRoot, string streamName)
+        => CreateNamed(runSeedRoot, streamName, captureTrace: true);
+
+    internal static Beta109WorldRng CreateNamed(ulong runSeedRoot, string streamName, bool captureTrace)
     {
         string normalizedStreamName = streamName ?? string.Empty;
         ulong seed = unchecked(runSeedRoot + XxHash64.HashUtf8(normalizedStreamName, 0UL));
-        return new Beta109WorldRng(new Xoshiro256StarStar(seed), normalizedStreamName);
+        return new Beta109WorldRng(new Xoshiro256StarStar(seed), normalizedStreamName, captureTrace);
     }
 
     /// <summary>
@@ -51,14 +56,17 @@ public sealed class Beta109WorldRng
 
     public static Beta109WorldRng FromCheckpoint(
         Beta109RngStateSnapshot checkpoint,
-        string streamDomain = "up_front") => new(
+        string streamDomain = "up_front") => FromCheckpoint(checkpoint, streamDomain, captureTrace: true);
+
+    internal static Beta109WorldRng FromCheckpoint(
+        Beta109RngStateSnapshot checkpoint, string streamDomain, bool captureTrace) => new(
         Xoshiro256StarStar.FromState(
             checkpoint.S0,
             checkpoint.S1,
             checkpoint.S2,
             checkpoint.S3,
             checkpoint.CallCount),
-        streamDomain);
+        streamDomain, captureTrace);
 
     public static ulong DeriveEventLocalSeed(
         ulong runSeedRoot,
@@ -80,7 +88,7 @@ public sealed class Beta109WorldRng
         WorldRngConsumptionShape consumptionShape = WorldRngConsumptionShape.Fixed)
     {
         int result = _rng.NextInt(maxExclusive);
-        _trace.Add(new WorldRngTraceEntry(
+        if (_captureTrace) _trace.Add(new WorldRngTraceEntry(
             _trace.Count,
             _streamDomain,
             sourceStage,
@@ -99,7 +107,7 @@ public sealed class Beta109WorldRng
         WorldRngConsumptionShape consumptionShape = WorldRngConsumptionShape.Fixed)
     {
         double result = _rng.NextDouble();
-        _trace.Add(new WorldRngTraceEntry(
+        if (_captureTrace) _trace.Add(new WorldRngTraceEntry(
             _trace.Count,
             _streamDomain,
             sourceStage,
@@ -113,7 +121,7 @@ public sealed class Beta109WorldRng
     public float NextFloat(string sourceStage)
     {
         float result = _rng.NextFloat();
-        _trace.Add(new WorldRngTraceEntry(
+        if (_captureTrace) _trace.Add(new WorldRngTraceEntry(
             _trace.Count,
             _streamDomain,
             sourceStage,
@@ -137,14 +145,27 @@ public sealed class Beta109WorldRng
         if (source.Count == 0) throw new InvalidOperationException("Beta109WorldCandidatePoolEmpty:" + sourceStage);
         int index = NextInt(source.Count, sourceStage);
         ModelKey selected = source[index];
-        WorldRngTraceEntry previous = _trace[^1];
-        _trace[^1] = previous with { SelectedKey = selected };
+        if (_captureTrace)
+        {
+            WorldRngTraceEntry previous = _trace[^1];
+            _trace[^1] = previous with { SelectedKey = selected };
+        }
         return selected;
     }
 
     public void UnstableShuffle<T>(IList<T> values, string sourceStage)
     {
         ArgumentNullException.ThrowIfNull(values);
+        if (!_captureTrace)
+        {
+            for (int count = values.Count; count > 1; count--)
+            {
+                int selected = _rng.NextInt(count);
+                int tail = count - 1;
+                (values[selected], values[tail]) = (values[tail], values[selected]);
+            }
+            return;
+        }
         for (int count = values.Count; count > 1; count--)
         {
             int selected = NextInt(
@@ -154,6 +175,16 @@ public sealed class Beta109WorldRng
             int tail = count - 1;
             (values[selected], values[tail]) = (values[tail], values[selected]);
         }
+    }
+
+    // Relic initialization's temporary permutation is never observed by the
+    // World replay. Search can advance the identical draws without allocating
+    // a throwaway list. Full/diagnostic replay must still materialize its trace.
+    internal void ConsumeUnobservedShuffle(int count)
+    {
+        if (_captureTrace) throw new InvalidOperationException("WorldTraceRequiresMaterializedShuffle");
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        for (; count > 1; count--) _rng.NextInt(count);
     }
 
     public void AnnotateLastSelection(ModelKey selectedKey)

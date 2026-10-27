@@ -11,6 +11,8 @@ internal sealed class NeowCpuPreGate
     private readonly ulong _allowedCurses;
     internal bool IdentityOnly { get; }
     internal bool FixedPair => _pair is not null;
+    internal CpuNeowBatchGate? CreateBatchGate(bool? requested = null) =>
+        CpuNeowBatchGate.TryCreate(_plan, _allowedCurses, requested);
     internal double GateSurvival { get; }
     // Donor e89849e: the fixed direct two-draw operator only. Other replay
     // bodies retain their own configuration boundary.

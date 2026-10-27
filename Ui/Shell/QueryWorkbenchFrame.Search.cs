@@ -32,6 +32,9 @@ internal sealed partial class QueryWorkbenchFrame
     }
     private readonly List<SearchCandidate> _results = [];
     private Button? _start;
+    private Label? _checkpointLabel;
+    private string _checkpointFingerprint = "";
+    private bool _pauseRequested;
     private Label? _status, _summary;
     private OptionButton? _planSelector;
     private SpinBox? _targetCount;
@@ -45,6 +48,10 @@ internal sealed partial class QueryWorkbenchFrame
     private readonly Dictionary<BaseButton, bool> _runBlocked = [];
     private int _target = 30;
     private double _saveTick;
+    private double _resultRefreshRemaining;
+    private bool _resultRefreshPending;
+    private long _completionFlushRetryAfter;
+    private bool _completionSaveFailed;
 
     internal WorkbenchSearchDraft CaptureDraft()
     {
@@ -258,10 +265,11 @@ internal sealed partial class QueryWorkbenchFrame
                 if(_status is not null) _status.Text="";
             }
             _lastIssue="";
+            UpdateSearchAction();
         }
         catch(Exception ex)
         {
-            if(_start is not null) _start.Disabled=true;
+            _checkpointFingerprint = "";
             _analysisKey="";
             _probabilityPreview.Invalidate();
             _probabilityPending = false;
@@ -270,12 +278,14 @@ internal sealed partial class QueryWorkbenchFrame
             _expectationContext="";
             PresentExpectations(null,null,null);
             if(ex.Message!=_lastIssue || _status?.Text.Length==0) { if(_status is not null) _status.Text=Explain(ex); _lastIssue=ex.Message; }
+            UpdateSearchAction();
         }
     }
 
     private void StartSearch()
     {
         if (_presetBlocked.Count > 0 || _manualValidation is not null || _persistence.HasSearchInFlight) return;
+        bool intentValidated = false;
         try
         {
             if (_loadFailed) throw new InvalidOperationException("integration.load_shape");
@@ -283,30 +293,96 @@ internal sealed partial class QueryWorkbenchFrame
             var draft=CaptureDraft();
             var compiled=draft.Compile(_runtime,out _);
             if(compiled.Status==QueryNormalizationStatus.Impossible || SearchFeasibilityAnalyzer.Analyze(compiled).IsImpossible) throw new InvalidOperationException("integration.impossible");
+            intentValidated = true;
             UpdateProbabilityPanel(draft,JsonSerializer.Serialize(draft.WithoutCapturedAuthority()));
             _persistence.InitializeWorkbenchCursor();
-            var execution=ExactSearchExecutionRequestFactory.Compile(compiled,new SearchRunOptions(_persistence.CurrentNextCursorSeed,
-                long.MaxValue,_target,SearchWorkers, SkipExactValidation: _persistence.Preferences.SkipExactValidation));
-            if(!execution.Success || execution.Plan is null) throw new InvalidOperationException(execution.Issue);
             _persistence.EnsureEnvironment(SearchEnvironmentSignatureBuilder.Capture(_runtime));
+            ulong startOrdinal = _persistence.ResolveSearchStartOrdinal(compiled.SemanticFingerprint);
+            var execution=ExactSearchExecutionRequestFactory.Compile(compiled,new SearchRunOptions(Beta110SeedCodec.FormatOrdinal(startOrdinal),
+                long.MaxValue,_target,SearchWorkers, SkipExactValidation: _persistence.Preferences.SkipExactValidation)
+                { Resources = SearchResources, Optimizations = SearchOptimizations });
+            if(!execution.Success || execution.Plan is null) throw new InvalidOperationException(execution.Issue);
+            var request = ExactWorldProjectionPolicy.ApplyOrdinarySearchPolicy(execution.Plan);
             _persistence.SaveWorkbench(draft);
-            var session=FamilyExecutionCoordinator.Start(execution.Plan,queueCapacity:64,
-                gpuAvailable:_persistence.Preferences.SearchMode=="CPU"?false:null);
-            _session=session; _lastDiagnostics=null; _activeFingerprint=compiled.SemanticFingerprint; _resultPlan=execution.Plan;
+            var session=FamilyExecutionCoordinator.Start(request,queueCapacity:64,
+                gpuAvailable:SearchCpuOnly?false:null);
+            _session=session; _lastDiagnostics=null; _activeFingerprint=compiled.SemanticFingerprint; _resultPlan=request;
+            _completionFlushRetryAfter = 0; _completionSaveFailed = false;
+            _persistence.BeginResultReception(session, Math.Clamp(_target, 1, SearchResultReceiver.MaximumUiCapacity));
+            _pauseRequested = false; _checkpointFingerprint = compiled.SemanticFingerprint;
+            _persistence.BeginSearchCheckpoint(_activeFingerprint, startOrdinal);
             _persistence.TrackSearch(session);
             _probabilityPreview.Invalidate();
             _probabilityPending = false;
 
             BeginRuntimeProgress(session.EtaProjection, session.GetProgress());
             _results.Clear(); InstallResultContext(draft);
-            _persistence.ResetWorkspaceForSuccessfulStart(_activeFingerprint, draft, _resultSeedContext, execution.Plan.RunOptions.SkipExactValidation);
+            _persistence.ResetWorkspaceForSuccessfulStart(_activeFingerprint, draft, _resultSeedContext, request.RunOptions.SkipExactValidation);
             _observedResultBatchId = _persistence.Workspace.ResultBatchId;
             _observedResultsRevision = _persistence.ResultsRevision;
             _showResults=true;
             RenderResults(); LockForRun(true);
-            RuntimeLog.Info("workbenchProductionStart=true;terminal="+(execution.Plan.RunOptions.SkipExactValidation?"UnverifiedCandidates":"ProductionExact")+";fingerprint="+_activeFingerprint);
+            RuntimeLog.Info("workbenchProductionStart=true;terminal="+(request.RunOptions.SkipExactValidation?"UnverifiedCandidates":"ProductionExact")+";fingerprint="+_activeFingerprint);
         }
-        catch(Exception ex) { if(_status is not null) _status.Text=Explain(ex); }
+        catch(Exception ex)
+        {
+            // Start may have created a session before a later binding/UI step
+            // failed. Keep it owned and polled until cancellation/cleanup ends.
+            if (_session is { } pending)
+            {
+                _persistence.TrackSearch(pending);
+                _pauseRequested = true;
+                pending.Cancel();
+                UpdateSearchAction();
+            }
+            else
+            {
+                _checkpointFingerprint = "";
+                if (!intentValidated) _draftCompileIssue = ex.Message;
+                UpdateSearchAction();
+            }
+            if(_status is not null) _status.Text=Explain(ex);
+        }
+    }
+
+    private void SetCheckpointFingerprint(string fingerprint)
+    {
+        _checkpointFingerprint = fingerprint;
+        UpdateSearchAction();
+    }
+
+    private void UpdateSearchAction()
+    {
+        if (_start is null || !GodotObject.IsInstanceValid(_start)) return;
+        bool running = _session is not null;
+        bool resume = !running && _persistence.CanResumeSearch(_checkpointFingerprint);
+        _start.Text = _text.Get(running ? _pauseRequested ? "integration.pausing" : "integration.pause" :
+            resume ? "integration.resume" : "query.action.start");
+        _start.TooltipText = _text.Get(running ? "integration.pause_hint" : "integration.resume_hint");
+        _start.Disabled = running ? _pauseRequested : _loadFailed || _presetBlocked.Count > 0 ||
+            _manualValidation is not null || _persistence.HasSearchInFlight || _draftCompileIssue.Length > 0 ||
+            _editorContextIssue.Length > 0 || _lastIssue.Length > 0;
+        if (_checkpointLabel is not null && GodotObject.IsInstanceValid(_checkpointLabel))
+        {
+            _checkpointLabel.Text = running || resume
+                ? _text.Format("integration.resume_next", _persistence.CurrentNextCursorSeed)
+                : _checkpointFingerprint.Length > 0 && _persistence.Cursor.Initialized
+                    ? _text.Format("integration.start_at", _persistence.CurrentPersistentOriginSeed) : "";
+            _checkpointLabel.TooltipText = _text.Get("integration.resume_hint");
+        }
+    }
+
+    private void PauseSearch()
+    {
+        if (_session is not { } session || _pauseRequested) return;
+        _pauseRequested = true;
+        session.Cancel();
+        // Persist only the session's committed boundary. Submitted/in-flight
+        // roots are deliberately not used as a checkpoint.
+        _persistence.ObserveSessionCheckpoint(session, _activeFingerprint);
+        _persistence.SaveResultProgress(session.GetProgress());
+        _persistence.FlushAll();
+        UpdateSearchAction();
     }
 
     private void LockForRun(bool running)
@@ -325,7 +401,8 @@ internal sealed partial class QueryWorkbenchFrame
         }
         if(_targetCount is not null) _targetCount.Editable=!running;
         if(_planSelector is not null) _planSelector.Disabled=running;
-        if(_start is not null) { if(running) _start.Disabled=false; _start.Text=_text.Get(running?"integration.stop":"query.action.start"); }
+        if(_start is not null && running) _start.Disabled=false;
+        UpdateSearchAction();
         if(_runtimeSurface is not null) _runtimeSurface.Visible=_showResults;
         if(_showResults) foreach(var editor in new Control[] {_neowEditor,_combatEditor,_relicEditor,_ancientEditor,_eventEditor,_actInformationEditor,_transformationEditor,_shopEditor}) editor.Hide();
         UpdateResultNavigation();
@@ -370,7 +447,7 @@ internal sealed partial class QueryWorkbenchFrame
     private void RenderResults()
     {
         if(_resultRows is null) return;
-        if (_start is not null && _session is null) _start.Disabled = _manualValidation is not null;
+        UpdateSearchAction();
         foreach(var child in _resultRows.GetChildren()) { _resultRows.RemoveChild(child); child.QueueFree(); }
         var header = new HBoxContainer();
         header.AddThemeConstantOverride("separation", 12);
@@ -453,45 +530,56 @@ internal sealed partial class QueryWorkbenchFrame
         if(_runtimeSurface is not null) _runtimeSurface.Visible=_showResults;
         UpdateRuntimeStats();
         UpdateResultNavigation();
+        _resultRefreshPending = false;
+        _resultRefreshRemaining = .1;
     }
     private void PollProduction(double delta)
     {
         PollCandidateValidation();
+        _resultRefreshRemaining = Math.Max(0, _resultRefreshRemaining - Math.Max(0, delta));
         if (_receiptRemaining>0 && _session is null)
         { _receiptRemaining-=delta; if(_receiptRemaining<=0 && _status is not null && string.IsNullOrEmpty(_lastIssue)) _status.Text=""; }
         if(_session is { } session)
         {
-            bool changed=false;
-            void Drain()
-            {
-                while(session.TryReadCandidate(out var candidate)) if(candidate is not null)
-                { _results.Add(candidate); _persistence.AppendResult(candidate,_activeFingerprint); changed=true; }
-            }
-            Drain();
+            bool changed = _persistence.DrainReceivedResults(session, _activeFingerprint, _results) > 0;
+            bool forceRender = false;
             var progress=session.GetProgress();
-            if(_status is not null) _status.Text="";
-            if(session.TryGetSafeNextOrdinal(out var next) && next<Beta110SeedCodec.SpaceSize) _persistence.ObserveSafeNextCursor(next);
-            if(session.Completion.IsCompleted)
+            if(_status is not null) _status.Text = _completionSaveFailed ? _text.Get("integration.checkpoint_save_failed") :
+                _pauseRequested ? _text.Get("integration.pausing") : "";
+            _persistence.ObserveSessionCheckpoint(session, _activeFingerprint);
+            UpdateSearchAction();
+            if(_persistence.SessionResultsFullyDrained(session) && System.Environment.TickCount64 >= _completionFlushRetryAfter)
             {
-                // Completion is the publication/cleanup boundary. A worker may
-                // have enqueued its last result after the first empty read.
-                Drain();
+                // Both the source and its single receiver have joined, and all
+                // buffered candidates were appended on this main thread.
+                _persistence.DrainReceivedResults(session, _activeFingerprint, _results);
                 progress=session.GetProgress();
-                if(session.TryGetSafeNextOrdinal(out var finalNext) && finalNext<Beta110SeedCodec.SpaceSize)
-                    _persistence.ObserveSafeNextCursor(finalNext);
-                if (session.TryGetSafeNextOrdinal(out var end) && end == Beta110SeedCodec.SpaceSize)
-                    _persistence.CommitEndOfSpaceWrap();
                 _lastDiagnostics=session.GetDiagnosticSummary();
-                _persistence.SaveResultProgress(progress);
-                _persistence.ReleaseSearch(session);
-                _session=null; _persistence.FlushAll(); _=session.DisposeAsync();
-                if(_status is not null) _status.Text=_text.Get(progress.State==SearchRunState.Faulted?"integration.failed":progress.State==SearchRunState.Cancelled?"integration.stopped":"integration.completed")+
-                    (string.IsNullOrEmpty(progress.FailureCode)?"":"\n"+progress.FailureCode);
-                _receiptRemaining = progress.State == SearchRunState.Faulted ? 0 : 5;
-                LockForRun(false); changed=true;
+                string receiveIssue = _persistence.ResultReceptionFailure(session)?.Message ?? "";
+                if (!_persistence.TryCompleteResultReception(session, _activeFingerprint))
+                {
+                    // Keep ownership and input locking until both results and
+                    // resume cursor are durable; retry without per-frame I/O.
+                    _completionSaveFailed = true; _pauseRequested = true;
+                    _completionFlushRetryAfter = System.Environment.TickCount64 + 600;
+                    if (_status is not null) _status.Text = _text.Get("integration.checkpoint_save_failed");
+                    UpdateSearchAction();
+                }
+                else
+                {
+                    _session=null; _=session.DisposeAsync();
+                    _pauseRequested = false; _completionSaveFailed = false;
+                    if(_status is not null) _status.Text=(receiveIssue.Length > 0 ? _text.Get("integration.failed") : progress.State == SearchRunState.Cancelled
+                        ? _text.Format("integration.paused", _persistence.CurrentNextCursorSeed)
+                        : _text.Get(progress.State==SearchRunState.Faulted?"integration.failed":"integration.completed"))+
+                        (string.IsNullOrEmpty(progress.FailureCode)?"":"\n"+progress.FailureCode) + (receiveIssue.Length == 0 ? "" : "\n" + receiveIssue);
+                    _receiptRemaining = progress.State == SearchRunState.Faulted || receiveIssue.Length > 0 ? 0 : 5;
+                    LockForRun(false); changed=true; forceRender=true;
+                }
             }
             ObserveRuntimeProgress(progress); UpdateRuntimeStats();
-            if(changed) RenderResults();
+            _resultRefreshPending |= changed;
+            if(forceRender || (_resultRefreshPending && _resultRefreshRemaining <= 0)) RenderResults();
         }
         _saveTick+=delta;
         if(_saveTick<.75 || !_restored) return;
@@ -509,7 +597,7 @@ internal sealed partial class QueryWorkbenchFrame
         CloseAllPresetModals();
         if(_session is { } session)
         {
-            session.Cancel();
+            PauseSearch();
             _persistence.SaveResultProgress(session.GetProgress());
             // Keep polling the cancelled session while the shell closes, until the existing
             // terminal drain has delivered results and its safe cursor.
